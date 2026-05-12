@@ -587,6 +587,27 @@ impl PaymentVerifier {
     }
 
     /// Verify each quote's `pub_key` matches the claimed peer ID via BLAKE3.
+    ///
+    /// We deliberately do NOT downscore the offending `encoded_peer_id` from
+    /// here, even though that would seem like the natural mirror of the
+    /// client-side bad-binding penalty. The reason is a trust-poisoning
+    /// vector: the `(encoded_peer_id, quote)` tuple is assembled by the
+    /// payment uploader, and the quote's signature covers
+    /// `(content, timestamp, price, rewards_address)` only — neither the
+    /// `pub_key` field nor the `encoded_peer_id` is part of the signed
+    /// payload. A malicious uploader could therefore pair a victim's
+    /// `peer_id` with an unrelated (or bogus) quote to trigger a trust
+    /// penalty against the victim while not providing any cryptographic
+    /// evidence that the victim misbehaved. The storer can still
+    /// **reject** the proof structurally — that's harmless to bystanders —
+    /// but it cannot safely attribute the fault to any specific peer
+    /// without authenticated peer-id binding on the wire.
+    ///
+    /// Trust-based eviction of bad-binding peers therefore lives only on
+    /// the client side (`ant-client/ant-core/src/data/client/quote.rs`),
+    /// where the responding peer's identity is grounded in the QUIC
+    /// connection from `find_closest_peers` rather than in attacker-
+    /// controlled proof bytes.
     fn validate_peer_bindings(payment: &ProofOfPayment) -> Result<()> {
         for (encoded_peer_id, quote) in &payment.peer_quotes {
             let expected_peer_id = peer_id_from_public_key_bytes(&quote.pub_key)
@@ -2699,6 +2720,119 @@ mod tests {
             err_msg.contains("Underpayment"),
             "Error should mention underpayment: {err_msg}"
         );
+    }
+
+    // ============================================================
+    // plan-1-bad-node-eviction §C: storer-side bad-binding rejection.
+    //
+    // The storer rejects payment proofs whose quote `pub_key` does not
+    // BLAKE3-hash to the claimed `EncodedPeerId`. We deliberately do
+    // NOT downscore the offender from this code path — the
+    // `EncodedPeerId` field is set by the payment uploader and is not
+    // part of the quote signature payload, so a malicious uploader
+    // could otherwise pair a victim's peer-id with a bogus quote to
+    // poison the victim's trust score (see the doc comment on
+    // `validate_peer_bindings`). The client-side downscore in
+    // `ant-client/ant-core/src/data/client/quote.rs` is the safe
+    // attribution path; storer-side eviction would need authenticated
+    // peer-id binding on the wire.
+    // ============================================================
+
+    /// Build a `ProofOfPayment` containing a single quote whose `pub_key`
+    /// is a fresh ML-DSA-65 public key paired with a deliberately *random*
+    /// `EncodedPeerId` — so `BLAKE3(pub_key) != peer_id` and the validator
+    /// must reject it.
+    fn proof_with_bad_binding() -> evmlib::ProofOfPayment {
+        use crate::payment::metrics::QuotingMetricsTracker;
+        use crate::payment::quote::{QuoteGenerator, XorName};
+        use evmlib::{EncodedPeerId, RewardsAddress};
+        use saorsa_core::MlDsa65;
+        use saorsa_pqc::pqc::types::MlDsaSecretKey;
+        use saorsa_pqc::pqc::MlDsaOperations;
+
+        let ml_dsa = MlDsa65::new();
+        let (public_key, secret_key) = ml_dsa.generate_keypair().expect("keygen");
+        let rewards_address = RewardsAddress::new([0u8; 20]);
+        let metrics_tracker = QuotingMetricsTracker::new(0);
+        let mut generator = QuoteGenerator::new(rewards_address, metrics_tracker);
+        let pub_key_bytes = public_key.as_bytes().to_vec();
+        let sk_bytes = secret_key.as_bytes().to_vec();
+        generator.set_signer(pub_key_bytes, move |msg| {
+            let sk = MlDsaSecretKey::from_bytes(&sk_bytes).expect("sk parse");
+            let ml_dsa = MlDsa65::new();
+            ml_dsa.sign(&sk, msg).expect("sign").as_bytes().to_vec()
+        });
+        let content: XorName = [0u8; 32];
+        let quote = generator.create_quote(content, 4096, 0).expect("quote");
+
+        // The crossed-key shape: the EncodedPeerId is random rather than
+        // BLAKE3(pub_key), mirroring the production failure pattern (an
+        // operator running two co-located identities with crossed keys).
+        let bad_peer_id = EncodedPeerId::new(rand::random());
+        evmlib::ProofOfPayment {
+            peer_quotes: vec![(bad_peer_id, quote)],
+        }
+    }
+
+    /// C1: A `ProofOfPayment` with one bad-binding quote is rejected with
+    /// the expected `Error::Payment`. Regression guard for the storer's
+    /// existing structural defence against crossed-key proofs.
+    #[test]
+    fn validate_peer_bindings_rejects_bad_binding_proofs() {
+        let proof = proof_with_bad_binding();
+        let result = PaymentVerifier::validate_peer_bindings(&proof);
+        assert!(
+            matches!(result, Err(Error::Payment(_))),
+            "expected Err(Error::Payment(..)) for bad-binding proof, got {result:?}"
+        );
+        if let Err(Error::Payment(msg)) = &result {
+            assert!(
+                msg.contains("Quote pub_key does not belong to claimed peer")
+                    || msg.contains("Invalid ML-DSA public key"),
+                "expected the bad-binding error message, got: {msg}"
+            );
+        }
+    }
+
+    /// C2: A `ProofOfPayment` whose every quote has a self-consistent
+    /// `pub_key`/`peer_id` pair passes `validate_peer_bindings` cleanly.
+    #[test]
+    fn validate_peer_bindings_passes_through_when_all_quotes_clean() {
+        use crate::payment::metrics::QuotingMetricsTracker;
+        use crate::payment::quote::{QuoteGenerator, XorName};
+        use evmlib::{EncodedPeerId, RewardsAddress};
+        use saorsa_core::identity::node_identity::peer_id_from_public_key_bytes;
+        use saorsa_core::MlDsa65;
+        use saorsa_pqc::pqc::types::MlDsaSecretKey;
+        use saorsa_pqc::pqc::MlDsaOperations;
+
+        let ml_dsa = MlDsa65::new();
+        let mut peer_quotes = Vec::new();
+
+        for _ in 0..3u8 {
+            let (public_key, secret_key) = ml_dsa.generate_keypair().expect("keygen");
+            let rewards_address = RewardsAddress::new([0u8; 20]);
+            let metrics_tracker = QuotingMetricsTracker::new(0);
+            let mut generator = QuoteGenerator::new(rewards_address, metrics_tracker);
+            let pub_key_bytes = public_key.as_bytes().to_vec();
+            let sk_bytes = secret_key.as_bytes().to_vec();
+            generator.set_signer(pub_key_bytes.clone(), move |msg| {
+                let sk = MlDsaSecretKey::from_bytes(&sk_bytes).expect("sk parse");
+                let ml_dsa = MlDsa65::new();
+                ml_dsa.sign(&sk, msg).expect("sign").as_bytes().to_vec()
+            });
+            let content: XorName = [0u8; 32];
+            let quote = generator.create_quote(content, 4096, 0).expect("quote");
+
+            // The well-bound shape: PeerId derives from BLAKE3(pub_key).
+            let derived = peer_id_from_public_key_bytes(&pub_key_bytes).expect("derive");
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(derived.as_bytes());
+            peer_quotes.push((EncodedPeerId::new(bytes), quote));
+        }
+
+        let proof = evmlib::ProofOfPayment { peer_quotes };
+        PaymentVerifier::validate_peer_bindings(&proof).expect("clean proof must validate");
     }
 
     // =========================================================================
