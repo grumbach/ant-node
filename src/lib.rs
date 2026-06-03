@@ -42,6 +42,11 @@
 // unused. These are expected and harmless — the compiler optimises them away.
 #![cfg_attr(not(feature = "logging"), allow(unused_variables, unused_assignments))]
 
+/// In-tree adversary behaviour hooks for large-testnet verification.
+/// Gated behind `cfg(feature = "adversary")`; never present in
+/// production builds.
+#[cfg(feature = "adversary")]
+pub mod adversary;
 pub mod ant_protocol;
 pub mod client;
 pub mod config;

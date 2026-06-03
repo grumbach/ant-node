@@ -45,11 +45,11 @@ const NEIGHBOR_SYNC_INTERVAL_MIN_SECS: u64 = 10 * 60;
 /// Maximum neighbor-sync cadence.
 const NEIGHBOR_SYNC_INTERVAL_MAX_SECS: u64 = 20 * 60;
 
-/// Neighbor sync cadence range (min).
+/// Neighbor sync cadence range (min). Production default constant.
 pub const NEIGHBOR_SYNC_INTERVAL_MIN: Duration =
     Duration::from_secs(NEIGHBOR_SYNC_INTERVAL_MIN_SECS);
 
-/// Neighbor sync cadence range (max).
+/// Neighbor sync cadence range (max). Production default constant.
 pub const NEIGHBOR_SYNC_INTERVAL_MAX: Duration =
     Duration::from_secs(NEIGHBOR_SYNC_INTERVAL_MAX_SECS);
 
@@ -57,6 +57,37 @@ pub const NEIGHBOR_SYNC_INTERVAL_MAX: Duration =
 const NEIGHBOR_SYNC_COOLDOWN_SECS: u64 = 60 * 60; // 1 hour
 /// Per-peer minimum spacing between successive syncs with the same peer.
 pub const NEIGHBOR_SYNC_COOLDOWN: Duration = Duration::from_secs(NEIGHBOR_SYNC_COOLDOWN_SECS);
+
+/// Neighbor-sync cadence (min). Override with `ANT_NEIGHBOR_SYNC_MIN_SECS`.
+///
+/// Repair hints — the precondition for audits — form during neighbor-sync
+/// rounds, so the large-testnet harness shortens this so audits have proofs
+/// to work with inside a bounded run. Unset in production → default applies.
+#[must_use]
+pub fn neighbor_sync_interval_min() -> Duration {
+    Duration::from_secs(secs_from_env_or(
+        "ANT_NEIGHBOR_SYNC_MIN_SECS",
+        NEIGHBOR_SYNC_INTERVAL_MIN_SECS,
+    ))
+}
+
+/// Neighbor-sync cadence (max). Override with `ANT_NEIGHBOR_SYNC_MAX_SECS`.
+#[must_use]
+pub fn neighbor_sync_interval_max() -> Duration {
+    Duration::from_secs(secs_from_env_or(
+        "ANT_NEIGHBOR_SYNC_MAX_SECS",
+        NEIGHBOR_SYNC_INTERVAL_MAX_SECS,
+    ))
+}
+
+/// Per-peer neighbor-sync cooldown. Override with `ANT_NEIGHBOR_SYNC_COOLDOWN_SECS`.
+#[must_use]
+pub fn neighbor_sync_cooldown() -> Duration {
+    Duration::from_secs(secs_from_env_or(
+        "ANT_NEIGHBOR_SYNC_COOLDOWN_SECS",
+        NEIGHBOR_SYNC_COOLDOWN_SECS,
+    ))
+}
 
 /// Minimum self-lookup cadence.
 const SELF_LOOKUP_INTERVAL_MIN_SECS: u64 = 5 * 60;
@@ -98,10 +129,43 @@ const AUDIT_TICK_INTERVAL_MIN_SECS: u64 = 10 * 60;
 /// Maximum audit-scheduler cadence.
 const AUDIT_TICK_INTERVAL_MAX_SECS: u64 = 20 * 60;
 
-/// Audit scheduler cadence range (min).
+/// Read a `u64` seconds value from `var`, falling back to `default`.
+///
+/// Testnet-only time-acceleration knob: lets the large-testnet harness
+/// shorten audit/rotation cadences so the audit→eviction loop converges
+/// within a bounded run, WITHOUT changing the production defaults baked
+/// into the constants above. Unset in production → defaults apply.
+#[must_use]
+fn secs_from_env_or(var: &str, default: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(default)
+}
+
+/// Audit scheduler cadence range (min). Override with `ANT_AUDIT_TICK_MIN_SECS`.
+#[must_use]
+pub fn audit_tick_interval_min() -> Duration {
+    Duration::from_secs(secs_from_env_or(
+        "ANT_AUDIT_TICK_MIN_SECS",
+        AUDIT_TICK_INTERVAL_MIN_SECS,
+    ))
+}
+
+/// Audit scheduler cadence range (max). Override with `ANT_AUDIT_TICK_MAX_SECS`.
+#[must_use]
+pub fn audit_tick_interval_max() -> Duration {
+    Duration::from_secs(secs_from_env_or(
+        "ANT_AUDIT_TICK_MAX_SECS",
+        AUDIT_TICK_INTERVAL_MAX_SECS,
+    ))
+}
+
+/// Audit scheduler cadence range (min). Production default constant.
 pub const AUDIT_TICK_INTERVAL_MIN: Duration = Duration::from_secs(AUDIT_TICK_INTERVAL_MIN_SECS);
 
-/// Audit scheduler cadence range (max).
+/// Audit scheduler cadence range (max). Production default constant.
 pub const AUDIT_TICK_INTERVAL_MAX: Duration = Duration::from_secs(AUDIT_TICK_INTERVAL_MAX_SECS);
 
 /// Floor on the audit response deadline (independent of challenge size).
@@ -194,6 +258,48 @@ pub const PENDING_VERIFY_MAX_AGE: Duration = Duration::from_secs(PENDING_VERIFY_
 /// Trust event weight for confirmed audit failures.
 pub const AUDIT_FAILURE_TRUST_WEIGHT: f64 = 5.0;
 
+/// Consecutive audit *timeouts* a peer may accumulate before a timeout is
+/// reported as an `ApplicationFailure` trust event.
+///
+/// The audit response timeout is "an economic deterrent calibrated for
+/// residential bandwidth, NOT a hard cryptographic bound": a single slow
+/// response is a routine occurrence for an honest node under transient load
+/// (GC pause, disk flush, a burst of concurrent requests). Penalizing on the
+/// first timeout false-positives those nodes — on a 400-node testnet 43 of 360
+/// honest slots took timeout failures and 52 were routing-table-evicted purely
+/// from one-off slowness.
+///
+/// Requiring `N` *consecutive* timeouts before penalizing kills that
+/// false-positive while preserving the relay defense. A `relay` adversary
+/// stores no data and must fetch every challenged chunk from a neighbor at
+/// audit time, so it is slow on *every* audit and accumulates a fresh strike
+/// each tick until it crosses the threshold. An honest node, by contrast,
+/// answers normally between rare slow ticks, and any success resets its strike
+/// counter to zero (see `handle_audit_result`) — so its strikes never
+/// accumulate to the threshold. The discriminator is *persistence* of slowness
+/// (relay = bad) versus *transience* (honest = fine), which is exactly what a
+/// reset-on-success strike counter measures. This deliberately does NOT widen
+/// the per-challenge window, so a relay still cannot fetch-and-answer in time.
+///
+/// Three is the smallest threshold that tolerates back-to-back transient
+/// slowness yet still penalizes a relay within a few audit ticks. Applies ONLY
+/// to `AuditFailureReason::Timeout`; confirmed storage-integrity failures
+/// (`DigestMismatch` / `KeyAbsent` / `Rejected` / `MalformedResponse`) remain
+/// instantly punishable. Override with `ANT_AUDIT_TIMEOUT_STRIKES` for tests.
+#[must_use]
+pub fn audit_timeout_strike_threshold() -> u32 {
+    u32::try_from(secs_from_env_or(
+        "ANT_AUDIT_TIMEOUT_STRIKES",
+        AUDIT_TIMEOUT_STRIKE_THRESHOLD_DEFAULT,
+    ))
+    .unwrap_or(AUDIT_TIMEOUT_STRIKE_THRESHOLD_U32)
+}
+
+/// Default consecutive-timeout strike threshold (production value).
+const AUDIT_TIMEOUT_STRIKE_THRESHOLD_DEFAULT: u64 = 3;
+/// Same value typed as `u32` for the env-parse fallback.
+const AUDIT_TIMEOUT_STRIKE_THRESHOLD_U32: u32 = 3;
+
 /// Maximum number of prune-confirmation audit challenges sent per prune pass.
 pub const MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS: usize = 64;
 
@@ -273,13 +379,13 @@ impl Default for ReplicationConfig {
             paid_list_close_group_size: PAID_LIST_CLOSE_GROUP_SIZE,
             neighbor_sync_scope: NEIGHBOR_SYNC_SCOPE,
             neighbor_sync_peer_count: NEIGHBOR_SYNC_PEER_COUNT,
-            neighbor_sync_interval_min: NEIGHBOR_SYNC_INTERVAL_MIN,
-            neighbor_sync_interval_max: NEIGHBOR_SYNC_INTERVAL_MAX,
-            neighbor_sync_cooldown: NEIGHBOR_SYNC_COOLDOWN,
+            neighbor_sync_interval_min: neighbor_sync_interval_min(),
+            neighbor_sync_interval_max: neighbor_sync_interval_max(),
+            neighbor_sync_cooldown: neighbor_sync_cooldown(),
             self_lookup_interval_min: SELF_LOOKUP_INTERVAL_MIN,
             self_lookup_interval_max: SELF_LOOKUP_INTERVAL_MAX,
-            audit_tick_interval_min: AUDIT_TICK_INTERVAL_MIN,
-            audit_tick_interval_max: AUDIT_TICK_INTERVAL_MAX,
+            audit_tick_interval_min: audit_tick_interval_min(),
+            audit_tick_interval_max: audit_tick_interval_max(),
             audit_response_floor: Duration::from_secs(AUDIT_RESPONSE_FLOOR_SECS),
             audit_honest_read_bps: AUDIT_HONEST_READ_BPS,
             audit_response_honest_multiplier: AUDIT_RESPONSE_HONEST_MULTIPLIER,
@@ -509,6 +615,13 @@ mod tests {
     #[test]
     fn audit_failure_weight_is_five() {
         assert!((AUDIT_FAILURE_TRUST_WEIGHT - 5.0).abs() <= f64::EPSILON);
+    }
+
+    #[test]
+    fn audit_timeout_strike_threshold_default_is_three() {
+        // Smallest threshold that tolerates back-to-back transient slowness
+        // while still penalizing a persistently-slow relay within a few ticks.
+        assert_eq!(audit_timeout_strike_threshold(), 3);
     }
 
     #[test]

@@ -854,10 +854,23 @@ async fn verify_commitment_bound(
     if let Some(ctx) = commitment_ctx {
         let now = std::time::Instant::now();
         let mut guard = ctx.recent_provers.write().await;
+        let pin_hex = crate::replication::events::hex32(pin);
+        let peer_hex = crate::replication::events::peer_hex(challenged_peer);
         for key in &verified_keys {
             guard.record_proof(*key, *challenged_peer, *pin, now);
+            crate::replication::events::holder_credit_recorded(
+                &peer_hex,
+                &crate::replication::events::key_hex(key),
+                &pin_hex,
+            );
         }
     }
+    crate::replication::events::audit_outcome(
+        &crate::replication::events::peer_hex(challenged_peer),
+        challenge_id,
+        "passed_commitment_bound",
+        None,
+    );
     AuditTickResult::Passed {
         challenged_peer: *challenged_peer,
         keys_checked: verified_keys.len(),
@@ -905,6 +918,19 @@ async fn handle_audit_failure(
     }
 
     // Step 9d: Non-empty confirmed set -> emit evidence.
+    let gate = match reason {
+        AuditFailureReason::Timeout => "timeout",
+        AuditFailureReason::MalformedResponse => "structural",
+        AuditFailureReason::DigestMismatch => "bytes_hash",
+        AuditFailureReason::KeyAbsent => "missing_bytes",
+        AuditFailureReason::Rejected => "key_not_in_commitment",
+    };
+    crate::replication::events::audit_outcome(
+        &crate::replication::events::peer_hex(challenged_peer),
+        challenge_id,
+        "failed",
+        Some(gate),
+    );
     let evidence = FailureEvidence::AuditFailure {
         challenge_id,
         challenged_peer: *challenged_peer,
@@ -987,6 +1013,28 @@ pub async fn handle_audit_challenge_with_commitment(
         return AuditResponse::Bootstrapping {
             challenge_id: challenge.challenge_id,
         };
+    }
+
+    // Adversary `Relay` mode (testnet only): the relay attacker does not
+    // store the committed bytes; it fetches them from a neighbour at
+    // audit time. We model that fetch's wall-clock cost as a delay that
+    // exceeds the auditor's `audit_response_timeout` at EVERY sample size
+    // (2.5 s setup + 1.5 s per challenged key). This is deliberately
+    // above the auditor's k-scaled budget for all k (incl. k=1, where the
+    // budget is just the 2 s floor) so a relay reliably times out rather
+    // than slipping through on a tiny single-key sample — a real relay
+    // must issue a network request AND receive each chunk on top of the
+    // auditor's deadline, so this is conservative, not generous. The
+    // timeout → application_failure → (after the strike threshold) trust
+    // penalty is the detection path under test. After the simulated fetch
+    // we fall through to the normal honest answer path, so the response
+    // is structurally valid; the attack is purely temporal. In production
+    // builds this block does not exist.
+    #[cfg(feature = "adversary")]
+    if crate::adversary::is_relay() {
+        let k = challenge.keys.len() as u64;
+        let delay = std::time::Duration::from_millis(2500 + 1500 * k);
+        tokio::time::sleep(delay).await;
     }
 
     if challenge.challenged_peer_id != *self_peer_id.as_bytes() {

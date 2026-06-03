@@ -8,7 +8,13 @@
 
 /// Opaque handle representing an active App Nap prevention activity.
 /// The activity remains active as long as this value is alive.
+//
+// `dead_code`-allowed because this module is shared by `#[path]` include
+// across the `ant-node` and `ant-node-adversary` binaries; the latter
+// does not call `disable_app_nap`, so on macOS these items are unused
+// there. The guard keeps both binaries warning-clean under `-D warnings`.
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 pub type AppNapActivity = objc2::rc::Retained<objc2::runtime::NSObject>;
 
 /// Prevent macOS App Nap from throttling this process.
@@ -25,6 +31,7 @@ pub type AppNapActivity = objc2::rc::Retained<objc2::runtime::NSObject>;
 /// Returns an error string if the activity could not be created.
 #[cfg(target_os = "macos")]
 #[allow(clippy::unnecessary_wraps)] // Result kept for caller compatibility with non-macOS variant
+#[allow(dead_code)] // see AppNapActivity: unused in the adversary binary's include
 pub fn disable_app_nap() -> Result<AppNapActivity, String> {
     #[allow(unsafe_code)]
     // SAFETY: We call well-documented Cocoa APIs through the objc2 safe

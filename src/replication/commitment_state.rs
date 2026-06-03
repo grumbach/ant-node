@@ -284,6 +284,15 @@ impl ResponderCommitmentState {
         self.inner.read().slots.first().map(Arc::clone)
     }
 
+    /// Number of retained commitment slots currently populated
+    /// (`0..=RETAINED_COMMITMENT_SLOTS`). Used by the v12 event log to
+    /// record how many slots survived a rotation; carries no behavioural
+    /// meaning.
+    #[must_use]
+    pub fn retained_slot_count(&self) -> usize {
+        self.inner.read().slots.len()
+    }
+
     /// Drop every retained slot. Called when the local store has
     /// transitioned to empty: keeping the previously-advertised
     /// commitment alive would invite audit failures (we can no longer

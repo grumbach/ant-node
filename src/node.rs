@@ -34,6 +34,98 @@ use tokio_util::sync::CancellationToken;
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 
+/// Self-announce for the v12 large-testnet analysis pipeline: emit one
+/// record binding this node's own `peer_hex` to its slot so the analyzer
+/// can map `peer_hex` → `global_index` (the log filename) and → adversary
+/// mode. `role` is read from `ANT_ADVERSARY_MODE` (honest binary leaves
+/// it unset → `"honest"`; adversary binary reports its mode), so there is
+/// no dependency on the feature-gated `adversary` module. No-op without
+/// the `v12-event-log` feature.
+fn announce_self_for_v12(peer_id: &str) {
+    let role = std::env::var("ANT_ADVERSARY_MODE")
+        .ok()
+        .filter(|m| !m.is_empty() && m != "none")
+        .unwrap_or_else(|| "honest".to_string());
+    crate::replication::events::node_started(peer_id, &role, env!("CARGO_PKG_VERSION"));
+}
+
+/// Adversary-only background task: lazy / chunk-deleter modes delete a
+/// fraction of locally-stored chunks on a schedule, while the node keeps
+/// gossiping commitments as if it still held them. This is the canonical
+/// "committed-but-doesn't-store" attack the v12 storage-bound audit is
+/// designed to catch (the auditor's `bytes_hash` / `missing_bytes` gates
+/// fire when the node can't produce the committed bytes).
+///
+/// Activation is wall-clock gated by `ANT_ADVERSARY_GO_BAD_AT_UNIX_SEC`
+/// plus `delete_after`; chunk-deleter repeats every `delete_every`, lazy
+/// deletes once then keeps sweeping new arrivals on the same cadence.
+///
+/// Without the `adversary` feature this is an empty inline no-op, so the
+/// production call site carries zero behaviour and no `#[cfg]` gate.
+#[cfg(not(feature = "adversary"))]
+#[inline]
+fn spawn_adversary_deleter(
+    _storage: Arc<LmdbStorage>,
+    _shutdown: tokio_util::sync::CancellationToken,
+) {
+}
+
+/// See the no-op variant above for the contract. This (adversary-feature)
+/// variant spawns the actual deletion task.
+#[cfg(feature = "adversary")]
+fn spawn_adversary_deleter(
+    storage: Arc<LmdbStorage>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    use crate::adversary::{self, AdversaryMode};
+    let Some(cfg) = adversary::config() else {
+        return;
+    };
+    if !matches!(cfg.mode, AdversaryMode::Lazy | AdversaryMode::ChunkDeleter) {
+        return;
+    }
+    tokio::spawn(async move {
+        // Sleep until go_bad_at, then a further delete_after grace so the
+        // node first stores (and is credited as a holder) before dropping.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let start_at = cfg.go_bad_at.saturating_add(cfg.delete_after.as_secs());
+        if start_at > now {
+            let wait = std::time::Duration::from_secs(start_at - now);
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                () = tokio::time::sleep(wait) => {}
+            }
+        }
+        loop {
+            // Delete ~50% of currently-stored chunks.
+            match storage.all_keys().await {
+                Ok(keys) => {
+                    let mut deleted = 0usize;
+                    for (i, key) in keys.iter().enumerate() {
+                        if i % 2 == 0 && matches!(storage.delete(key).await, Ok(true)) {
+                            deleted += 1;
+                        }
+                    }
+                    if deleted > 0 {
+                        warn!(
+                            "adversary deleter ({:?}): dropped {deleted}/{} stored chunks",
+                            cfg.mode,
+                            keys.len()
+                        );
+                    }
+                }
+                Err(e) => warn!("adversary deleter: all_keys failed: {e}"),
+            }
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                () = tokio::time::sleep(cfg.delete_every) => {}
+            }
+        }
+    });
+}
+
 /// Builder for constructing an Ant node.
 pub struct NodeBuilder {
     config: NodeConfig,
@@ -46,6 +138,36 @@ impl NodeBuilder {
         Self { config }
     }
 
+    /// Reject startup in production mode without a usable rewards address.
+    ///
+    /// A node that cannot receive payment must not silently run on the
+    /// production network. The placeholder address shipped in the example
+    /// config and an empty string both count as "unconfigured".
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] if `network_mode` is `Production` and
+    /// `payment.rewards_address` is unset, empty, or the example placeholder.
+    fn validate_production_rewards_address(config: &NodeConfig) -> Result<()> {
+        if config.network_mode != NetworkMode::Production {
+            return Ok(());
+        }
+        let configured = config
+            .payment
+            .rewards_address
+            .as_deref()
+            .is_some_and(|addr| !addr.is_empty() && addr != "0xYOUR_ARBITRUM_ADDRESS_HERE");
+        if configured {
+            Ok(())
+        } else {
+            Err(Error::Config(
+                "CRITICAL: Rewards address is not configured. \
+                 Set payment.rewards_address in config to your Arbitrum wallet address."
+                    .to_string(),
+            ))
+        }
+    }
+
     /// Build and start the node.
     ///
     /// # Errors
@@ -54,32 +176,15 @@ impl NodeBuilder {
     pub async fn build(mut self) -> Result<RunningNode> {
         info!("Building ant-node with config: {:?}", self.config);
 
-        // Validate rewards address in production
-        if self.config.network_mode == NetworkMode::Production {
-            match self.config.payment.rewards_address {
-                None => {
-                    return Err(Error::Config(
-                        "CRITICAL: Rewards address is not configured. \
-                         Set payment.rewards_address in config to your Arbitrum wallet address."
-                            .to_string(),
-                    ));
-                }
-                Some(ref addr) if addr == "0xYOUR_ARBITRUM_ADDRESS_HERE" || addr.is_empty() => {
-                    return Err(Error::Config(
-                        "CRITICAL: Rewards address is not configured. \
-                         Set payment.rewards_address in config to your Arbitrum wallet address."
-                            .to_string(),
-                    ));
-                }
-                Some(_) => {}
-            }
-        }
+        Self::validate_production_rewards_address(&self.config)?;
 
         // Resolve identity and root_dir (may update self.config.root_dir)
         let identity = Arc::new(Self::resolve_identity(&mut self.config).await?);
         let peer_id = identity.peer_id().to_hex();
 
         info!(peer_id = %peer_id, root_dir = %self.config.root_dir.display(), "Node identity resolved");
+
+        announce_self_for_v12(&peer_id);
 
         // Ensure root directory exists
         std::fs::create_dir_all(&self.config.root_dir)?;
@@ -144,6 +249,8 @@ impl NodeBuilder {
             if let (Some(ref protocol), Some(fresh_rx)) = (&ant_protocol, fresh_write_rx) {
                 let repl_config = ReplicationConfig::default();
                 let storage_arc = protocol.storage();
+                // No-op without the `adversary` feature (see fn); never in production.
+                spawn_adversary_deleter(Arc::clone(&storage_arc), shutdown.clone());
                 let payment_verifier_arc = protocol.payment_verifier_arc();
                 match ReplicationEngine::new(
                     repl_config,
