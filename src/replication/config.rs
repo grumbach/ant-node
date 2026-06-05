@@ -232,6 +232,25 @@ pub const AUDIT_FAILURE_TRUST_WEIGHT: f64 = 5.0;
 /// `MalformedResponse`) remain instantly punishable.
 pub const AUDIT_TIMEOUT_STRIKE_THRESHOLD: u32 = 3;
 
+/// Probability of launching a subtree audit when a peer's *changed* commitment
+/// is ingested via gossip (ADR-0002). Keeps audits occasional surprise exams.
+pub const AUDIT_ON_GOSSIP_PROBABILITY: f64 = 0.2;
+
+/// Per-peer cooldown between gossip-triggered subtree audits (ADR-0002), in
+/// seconds. Bounds how often any one peer is audited regardless of gossip rate.
+pub const AUDIT_ON_GOSSIP_COOLDOWN_SECS: u64 = 30 * 60;
+
+/// Number of subtree leaves spot-checked against real chunk bytes per audit
+/// (ADR-0002 real-bytes layer).
+pub const AUDIT_SPOTCHECK_COUNT: u32 = 8;
+
+/// Conservative leaf-count hint for sizing the subtree-audit response deadline.
+///
+/// The deadline is set before the proof arrives, so we size for the largest
+/// legal store: `sqrt(MAX_COMMITMENT_KEY_COUNT) = 1000`. Honest small stores
+/// finish well within it.
+pub const SUBTREE_AUDIT_TIMEOUT_LEAF_HINT: usize = 1000;
+
 /// Maximum number of prune-confirmation audit challenges sent per prune pass.
 pub const MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS: usize = 64;
 
@@ -492,6 +511,24 @@ impl ReplicationConfig {
         // plus it) would overflow `Duration::MAX`.
         self.audit_response_floor
             .saturating_add(Duration::from_secs(scaled_secs))
+    }
+
+    /// Number of subtree leaves to spot-check against real chunk bytes per
+    /// audit (ADR-0002 real-bytes layer). Faking a fraction `x` of nonced
+    /// leaves survives only `(1 - x)^k`.
+    #[must_use]
+    pub fn audit_spotcheck_count(&self) -> u32 {
+        AUDIT_SPOTCHECK_COUNT
+    }
+
+    /// Conservative leaf-count hint for sizing the subtree-audit response
+    /// deadline before the proof arrives.
+    ///
+    /// The selected subtree holds about `sqrt(key_count)` real leaves; sizing
+    /// for a large store keeps an honest peer with a big store from timing out.
+    #[must_use]
+    pub fn subtree_audit_timeout_leaf_hint(&self) -> usize {
+        SUBTREE_AUDIT_TIMEOUT_LEAF_HINT
     }
 
     /// Returns a random duration in `[audit_tick_interval_min,

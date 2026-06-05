@@ -18,9 +18,13 @@ pub mod admission;
 pub mod audit;
 pub mod bootstrap;
 pub mod commitment;
-pub mod commitment_audit;
 pub mod commitment_state;
 pub mod config;
+/// Structured v12 event log for large-testnet attribution. Behind
+/// `cfg(feature = "v12-event-log")`; every helper is an inline no-op
+/// without the feature, so call sites are unconditional and zero-cost
+/// in production builds.
+pub mod events;
 pub mod fresh;
 pub mod neighbor_sync;
 pub mod paid_list;
@@ -29,6 +33,7 @@ pub mod pruning;
 pub mod quorum;
 pub mod recent_provers;
 pub mod scheduling;
+pub mod subtree;
 pub mod types;
 
 use std::collections::{HashMap, HashSet};
@@ -50,7 +55,7 @@ use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};
 use crate::payment::PaymentVerifier;
 use crate::replication::audit::AuditTickResult;
-use crate::replication::commitment::StorageCommitment;
+use crate::replication::commitment::{commitment_hash, StorageCommitment};
 use crate::replication::commitment_state::{PeerCommitmentRecord, ResponderCommitmentState};
 use crate::replication::config::{
     max_parallel_fetch, ReplicationConfig, MAX_CONCURRENT_REPLICATION_SENDS,
@@ -106,9 +111,6 @@ const FETCH_WORKER_POLL_MS: u64 = 100;
 
 /// Verification worker polling interval in milliseconds.
 const VERIFICATION_WORKER_POLL_MS: u64 = 250;
-
-/// Bootstrap drain check interval in seconds.
-const BOOTSTRAP_DRAIN_CHECK_SECS: u64 = 5;
 
 /// Standard trust event weight for per-operation success/failure signals.
 ///
@@ -216,6 +218,12 @@ pub struct ReplicationEngine {
     /// cycle reset. Grows with peer churn like `sync_history`; entries are a
     /// single `u32` and peer IDs are bounded by k-bucket capacity.
     audit_timeout_strikes: Arc<RwLock<HashMap<PeerId, u32>>>,
+    /// Per-peer cooldown for gossip-triggered subtree audits (ADR-0002).
+    ///
+    /// Records when each peer was last audited so a burst of gossiped
+    /// commitment changes cannot spawn back-to-back audits of the same peer.
+    /// Bounded by routing-table membership and cleaned on `PeerRemoved`.
+    audit_on_gossip_cooldown: Arc<RwLock<HashMap<PeerId, Instant>>>,
     /// Completed local neighbor-sync cycle epoch for proof maturity.
     sync_cycle_epoch: Arc<RwLock<u64>>,
     /// Per-key repair proof tracking for audit eligibility.
@@ -326,6 +334,7 @@ impl ReplicationEngine {
             sync_state: Arc::new(RwLock::new(initial_neighbors)),
             sync_history: Arc::new(RwLock::new(HashMap::new())),
             audit_timeout_strikes: Arc::new(RwLock::new(HashMap::new())),
+            audit_on_gossip_cooldown: Arc::new(RwLock::new(HashMap::new())),
             sync_cycle_epoch: Arc::new(RwLock::new(0)),
             repair_proofs: Arc::new(RwLock::new(RepairProofs::new())),
             bootstrap_state: Arc::new(RwLock::new(BootstrapState::new())),
@@ -372,6 +381,75 @@ impl ReplicationEngine {
         &self.recent_provers
     }
 
+    /// Test-only: rebuild + rotate this node's storage commitment now over its
+    /// current key set (normally on a 1h timer). Lets a test commit to chunks it
+    /// just stored without waiting for the rotation cadence.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from reading the local key set or building/signing
+    /// the commitment.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn rebuild_commitment_now(&self) -> Result<()> {
+        rebuild_and_rotate_commitment(
+            &self.storage,
+            &self.identity,
+            &self.commitment_state,
+            &self.p2p_node,
+        )
+        .await
+    }
+
+    /// Test-only: directly seed this node's cached commitment for `peer`,
+    /// simulating "we received `peer`'s gossiped commitment" without depending
+    /// on neighbor-sync propagation timing. Lets a two-node audit test pin the
+    /// peer's commitment deterministically.
+    #[cfg(any(feature = "test-utils", test))]
+    pub async fn inject_peer_commitment_for_test(
+        &self,
+        peer: &PeerId,
+        commitment: StorageCommitment,
+    ) {
+        let now = Instant::now();
+        self.last_commitment_by_peer
+            .write()
+            .await
+            .insert(*peer, PeerCommitmentRecord::from_verified(commitment, now));
+        self.ever_capable_peers.write().await.insert(*peer);
+    }
+
+    /// Test-only: run ONE subtree audit against `peer` right now, pinned to the
+    /// commitment this node has cached for it (from gossip), over the live wire.
+    /// Returns the audit outcome so tests can assert honest-pass / adversary-fail
+    /// in a real two-node setting without waiting for the gossip cadence.
+    ///
+    /// Returns `AuditTickResult::Idle` if we have no cached commitment for the
+    /// peer yet (gossip hasn't reached us). Gated to test builds.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn audit_peer_now(&self, peer: &PeerId) -> audit::AuditTickResult {
+        let target = {
+            let map = self.last_commitment_by_peer.read().await;
+            map.get(peer)
+                .and_then(|r| r.last_commitment.as_ref())
+                .and_then(|c| commitment_hash(c).map(|h| (h, c.key_count)))
+        };
+        let Some((pin, key_count)) = target else {
+            return audit::AuditTickResult::Idle;
+        };
+        let credit = audit::AuditCredit {
+            recent_provers: &self.recent_provers,
+        };
+        audit::run_subtree_audit(
+            &self.p2p_node,
+            &self.config,
+            peer,
+            pin,
+            key_count,
+            Some(&credit),
+        )
+        .await
+    }
+
     /// Start all background tasks.
     ///
     /// `dht_events` must be subscribed **before** `P2PNode::start()` so that
@@ -387,7 +465,8 @@ impl ReplicationEngine {
         self.start_message_handler();
         self.start_neighbor_sync_loop();
         self.start_self_lookup_loop();
-        self.start_audit_loop();
+        // ADR-0002: audits are gossip-triggered (in the message handler when a
+        // peer's changed commitment is ingested), not run on a periodic tick.
         self.start_commitment_rotation_loop();
         self.start_fetch_worker();
         self.start_verification_worker();
@@ -536,6 +615,19 @@ impl ReplicationEngine {
         let recent_provers = Arc::clone(&self.recent_provers);
         let sig_verify_attempts = Arc::clone(&self.sig_verify_attempts);
         let audit_timeout_strikes = Arc::clone(&self.audit_timeout_strikes);
+        let audit_on_gossip_cooldown = Arc::clone(&self.audit_on_gossip_cooldown);
+        let sync_state = Arc::clone(&self.sync_state);
+
+        // ADR-0002 gossip-audit trigger: bundled state so an ingested *changed*
+        // commitment can spawn a probabilistic, cooldown-gated subtree audit.
+        let gossip_audit = GossipAuditTrigger {
+            p2p_node: Arc::clone(&p2p),
+            config: Arc::clone(&config),
+            recent_provers: Arc::clone(&recent_provers),
+            sync_state: Arc::clone(&sync_state),
+            audit_timeout_strikes: Arc::clone(&audit_timeout_strikes),
+            cooldown: Arc::clone(&audit_on_gossip_cooldown),
+        };
 
         let handle = tokio::spawn(async move {
             loop {
@@ -582,6 +674,7 @@ impl ReplicationEngine {
                                     &ever_capable_peers,
                                     &sig_verify_attempts,
                                     &my_commitment_state,
+                                    &gossip_audit,
                                     rr_message_id.as_deref(),
                                 ).await {
                                     Ok(()) => {}
@@ -621,10 +714,15 @@ impl ReplicationEngine {
                                 last_commitment_by_peer.write().await.remove(&peer_id);
                                 recent_provers.write().await.forget_peer(&peer_id);
                                 sig_verify_attempts.write().await.remove(&peer_id);
+                                crate::replication::events::peer_removed(
+                                    &crate::replication::events::peer_hex(&peer_id),
+                                );
                                 // Drop the timeout-strike entry too, so a
                                 // departed peer leaves no residual (keeps this
                                 // map bounded under churn, like its siblings).
                                 audit_timeout_strikes.write().await.remove(&peer_id);
+                                // Same for the gossip-audit cooldown (ADR-0002).
+                                audit_on_gossip_cooldown.write().await.remove(&peer_id);
                                 // The sticky `commitment_capable` flag is
                                 // preserved orthogonally via
                                 // `ever_capable_peers` — even after this
@@ -660,6 +758,18 @@ impl ReplicationEngine {
         let last_commitment_by_peer = Arc::clone(&self.last_commitment_by_peer);
         let ever_capable_peers = Arc::clone(&self.ever_capable_peers);
         let sig_verify_attempts = Arc::clone(&self.sig_verify_attempts);
+        // ADR-0002: a peer's commitment also arrives on the sync RESPONSE path
+        // (we initiated, they piggybacked theirs). Carry a gossip-audit trigger
+        // here too so a peer that only ever answers — never initiates sync —
+        // is still audited; otherwise it could fully evade auditing.
+        let gossip_audit = GossipAuditTrigger {
+            p2p_node: Arc::clone(&p2p),
+            config: Arc::clone(&config),
+            recent_provers: Arc::clone(&self.recent_provers),
+            sync_state: Arc::clone(&sync_state),
+            audit_timeout_strikes: Arc::clone(&self.audit_timeout_strikes),
+            cooldown: Arc::clone(&self.audit_on_gossip_cooldown),
+        };
 
         let handle = tokio::spawn(async move {
             loop {
@@ -692,6 +802,7 @@ impl ReplicationEngine {
                         &last_commitment_by_peer,
                         &ever_capable_peers,
                         &sig_verify_attempts,
+                        &gossip_audit,
                     ) => {}
                 }
             }
@@ -718,115 +829,6 @@ impl ReplicationEngine {
                 }
             }
             debug!("Self-lookup loop shut down");
-        });
-        self.task_handles.push(handle);
-    }
-
-    fn start_audit_loop(&mut self) {
-        let p2p = Arc::clone(&self.p2p_node);
-        let storage = Arc::clone(&self.storage);
-        let config = Arc::clone(&self.config);
-        let shutdown = self.shutdown.clone();
-        let sync_history = Arc::clone(&self.sync_history);
-        let audit_timeout_strikes = Arc::clone(&self.audit_timeout_strikes);
-        let sync_cycle_epoch = Arc::clone(&self.sync_cycle_epoch);
-        let repair_proofs = Arc::clone(&self.repair_proofs);
-        let bootstrap_state = Arc::clone(&self.bootstrap_state);
-        let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
-        let sync_state = Arc::clone(&self.sync_state);
-        let last_commitment_by_peer = Arc::clone(&self.last_commitment_by_peer);
-        let ever_capable_peers = Arc::clone(&self.ever_capable_peers);
-        let recent_provers = Arc::clone(&self.recent_provers);
-
-        let handle = tokio::spawn(async move {
-            // Invariant 19: wait for bootstrap to drain before starting audits.
-            loop {
-                tokio::select! {
-                    () = shutdown.cancelled() => return,
-                    () = tokio::time::sleep(
-                        std::time::Duration::from_secs(BOOTSTRAP_DRAIN_CHECK_SECS)
-                    ) => {
-                        if bootstrap_state.read().await.is_drained() {
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Run one audit tick immediately after bootstrap drain.
-            {
-                let bootstrapping = *is_bootstrapping.read().await;
-                let ctx = audit::CommitmentAuditCtx {
-                    last_commitment_by_peer: &last_commitment_by_peer,
-                    ever_capable_peers: &ever_capable_peers,
-                    recent_provers: &recent_provers,
-                };
-                let result = {
-                    let history = sync_history.read().await;
-                    let current_sync_epoch = *sync_cycle_epoch.read().await;
-                    audit::audit_tick_with_repair_proofs(
-                        &p2p,
-                        &storage,
-                        &config,
-                        &history,
-                        &repair_proofs,
-                        current_sync_epoch,
-                        bootstrapping,
-                        Some(&ctx),
-                    )
-                    .await
-                };
-                handle_audit_result(
-                    &result,
-                    &p2p,
-                    &sync_state,
-                    &recent_provers,
-                    &audit_timeout_strikes,
-                    &config,
-                )
-                .await;
-            }
-
-            // Then run periodically.
-            loop {
-                let interval = config.random_audit_tick_interval();
-                tokio::select! {
-                    () = shutdown.cancelled() => break,
-                    () = tokio::time::sleep(interval) => {
-                        let bootstrapping = *is_bootstrapping.read().await;
-                        let ctx = audit::CommitmentAuditCtx {
-                            last_commitment_by_peer: &last_commitment_by_peer,
-                            ever_capable_peers: &ever_capable_peers,
-                            recent_provers: &recent_provers,
-                        };
-                        let result = {
-                            let history = sync_history.read().await;
-                            let current_sync_epoch = *sync_cycle_epoch.read().await;
-                            audit::audit_tick_with_repair_proofs(
-                                &p2p,
-                                &storage,
-                                &config,
-                                &history,
-                                &repair_proofs,
-                                current_sync_epoch,
-                                bootstrapping,
-                                Some(&ctx),
-                            )
-                            .await
-                        };
-                        handle_audit_result(
-                    &result,
-                    &p2p,
-                    &sync_state,
-                    &recent_provers,
-                    &audit_timeout_strikes,
-                    &config,
-                )
-                .await;
-                    }
-                }
-            }
-            debug!("Audit loop shut down");
         });
         self.task_handles.push(handle);
     }
@@ -1206,21 +1208,32 @@ impl ReplicationEngine {
                         &paid_list,
                         &config,
                         bootstrapping,
-                        my_commitment_state
-                            .current()
-                            .map(|b| b.commitment().clone()),
+                        my_commitment_state.current().map(|b| {
+                            // Mark gossiped: emitted in the bootstrap-sync
+                            // request, so we stay answerable for it (ADR-0002).
+                            my_commitment_state.mark_gossiped(b.hash());
+                            b.commitment().clone()
+                        }),
                     )
                     .await;
 
                     bootstrap::decrement_pending_requests(&bootstrap_state, 1).await;
 
                     if let Some(outcome) = outcome {
-                        // v12: ingest the peer's piggybacked commitment from
-                        // the response (same verification as request path).
-                        // Bootstrap path is the FIRST gossip we receive from
-                        // most peers, so populating last_commitment_by_peer
-                        // here lets the first audit after drain be
-                        // commitment-bound.
+                        // Ingest the peer's piggybacked commitment from the
+                        // response (same verification as the request path).
+                        // Bootstrap is the FIRST gossip we receive from most
+                        // peers, so this populates last_commitment_by_peer.
+                        //
+                        // We intentionally do NOT trigger a gossip-audit here:
+                        // during bootstrap this node may itself still be
+                        // bootstrapping (audits are gated on that), and the
+                        // close-group/RT view is not yet stable. The peer is
+                        // audited on the first STEADY-STATE neighbor-sync round
+                        // after bootstrap drains (request + response paths both
+                        // trigger), which is within one sync cycle — so caching
+                        // the commitment here is sufficient and there is no
+                        // coverage gap (ADR-0002).
                         ingest_peer_commitment(
                             peer,
                             outcome.response.commitment.as_ref(),
@@ -1318,6 +1331,7 @@ async fn handle_replication_message(
     ever_capable_peers: &Arc<RwLock<HashSet<PeerId>>>,
     sig_verify_attempts: &Arc<RwLock<HashMap<PeerId, Instant>>>,
     my_commitment_state: &Arc<ResponderCommitmentState>,
+    gossip_audit: &GossipAuditTrigger,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
     let msg = ReplicationMessage::decode(data)
@@ -1355,7 +1369,7 @@ async fn handle_replication_message(
             // commitment for use as `expected_commitment_hash` in
             // future audits. Verify signature before storing so a peer
             // cannot inject a forged commitment for someone else.
-            ingest_peer_commitment(
+            if let Some(target) = ingest_peer_commitment(
                 source,
                 request.commitment.as_ref(),
                 p2p_node,
@@ -1363,7 +1377,10 @@ async fn handle_replication_message(
                 ever_capable_peers,
                 sig_verify_attempts,
             )
-            .await;
+            .await
+            {
+                maybe_trigger_gossip_audit(gossip_audit, source, target).await;
+            }
             handle_neighbor_sync_request(
                 source,
                 request,
@@ -1377,9 +1394,12 @@ async fn handle_replication_message(
                 sync_history,
                 sync_cycle_epoch,
                 repair_proofs,
-                my_commitment_state
-                    .current()
-                    .map(|b| b.commitment().clone()),
+                my_commitment_state.current().map(|b| {
+                    // Mark gossiped: we emit this commitment in the sync
+                    // response, so we must stay answerable for it (ADR-0002).
+                    my_commitment_state.mark_gossiped(b.hash());
+                    b.commitment().clone()
+                }),
                 msg.request_id,
                 rr_message_id,
             )
@@ -1409,25 +1429,72 @@ async fn handle_replication_message(
             .await
         }
         ReplicationMessageBody::AuditChallenge(ref challenge) => {
+            // Single-key prune-confirmation audit (pre-existing): answer with
+            // per-key possession digests.
             let bootstrapping = *is_bootstrapping.read().await;
-            handle_audit_challenge_msg(
+            handle_prune_audit_challenge_msg(
                 source,
                 challenge,
                 storage,
                 p2p_node,
                 bootstrapping,
-                my_commitment_state,
                 msg.request_id,
                 rr_message_id,
             )
             .await
+        }
+        ReplicationMessageBody::SubtreeAuditChallenge(ref challenge) => {
+            // Gossip-triggered storage-bound subtree audit (ADR-0002).
+            let bootstrapping = *is_bootstrapping.read().await;
+            let response = audit::handle_subtree_challenge(
+                challenge,
+                storage,
+                p2p_node.peer_id(),
+                bootstrapping,
+                Some(my_commitment_state),
+            )
+            .await;
+            send_replication_response(
+                source,
+                p2p_node,
+                msg.request_id,
+                ReplicationMessageBody::SubtreeAuditResponse(response),
+                rr_message_id,
+            )
+            .await;
+            Ok(())
+        }
+        ReplicationMessageBody::SubtreeByteChallenge(ref challenge) => {
+            // Round 2 of the storage audit (ADR-0002): serve the original bytes
+            // for the auditor's nonce-selected spot-check keys, or signal
+            // `Absent` for a committed key we can no longer produce.
+            let bootstrapping = *is_bootstrapping.read().await;
+            let response = audit::handle_subtree_byte_challenge(
+                challenge,
+                storage,
+                p2p_node.peer_id(),
+                bootstrapping,
+                Some(my_commitment_state),
+            )
+            .await;
+            send_replication_response(
+                source,
+                p2p_node,
+                msg.request_id,
+                ReplicationMessageBody::SubtreeByteResponse(response),
+                rr_message_id,
+            )
+            .await;
+            Ok(())
         }
         // Response messages are handled by their respective request initiators.
         ReplicationMessageBody::FreshReplicationResponse(_)
         | ReplicationMessageBody::NeighborSyncResponse(_)
         | ReplicationMessageBody::VerificationResponse(_)
         | ReplicationMessageBody::FetchResponse(_)
-        | ReplicationMessageBody::AuditResponse(_) => Ok(()),
+        | ReplicationMessageBody::AuditResponse(_)
+        | ReplicationMessageBody::SubtreeAuditResponse(_)
+        | ReplicationMessageBody::SubtreeByteResponse(_) => Ok(()),
     }
 }
 
@@ -1860,26 +1927,20 @@ async fn handle_fetch_request(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn handle_audit_challenge_msg(
+/// Responder for a single-key prune-confirmation audit challenge.
+async fn handle_prune_audit_challenge_msg(
     source: &PeerId,
     challenge: &protocol::AuditChallenge,
     storage: &Arc<LmdbStorage>,
     p2p_node: &Arc<P2PNode>,
     is_bootstrapping: bool,
-    commitment_state: &Arc<ResponderCommitmentState>,
     request_id: u64,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
-    #[allow(clippy::cast_possible_truncation)]
-    let stored_chunks = storage.current_chunks().map_or(0, |c| c as usize);
-    let response = audit::handle_audit_challenge_with_commitment(
+    let response = crate::replication::pruning::handle_prune_audit_challenge(
         challenge,
         storage,
-        p2p_node.peer_id(),
         is_bootstrapping,
-        stored_chunks,
-        Some(commitment_state),
     )
     .await;
 
@@ -1999,6 +2060,7 @@ async fn run_neighbor_sync_round(
     last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
     ever_capable_peers: &Arc<RwLock<HashSet<PeerId>>>,
     sig_verify_attempts: &Arc<RwLock<HashMap<PeerId, Instant>>>,
+    gossip_audit: &GossipAuditTrigger,
 ) {
     let self_id = *p2p_node.peer_id();
     let bootstrapping = *is_bootstrapping.read().await;
@@ -2079,10 +2141,13 @@ async fn run_neighbor_sync_round(
     debug!("Neighbor sync: syncing with {} peers", batch.len());
 
     // Snapshot our current commitment once per round so all peers in
-    // this batch see the same thing (v12 §1: gossip is the responder's
-    // attestation; same value across the batch is fine and reduces
-    // RwLock churn).
-    let my_commitment = commitment_state.current().map(|b| b.commitment().clone());
+    // this batch see the same thing (gossip is the responder's attestation;
+    // same value across the batch is fine and reduces RwLock churn). Mark it
+    // gossiped so we stay answerable for it (ADR-0002 retention).
+    let my_commitment = commitment_state.current().map(|b| {
+        commitment_state.mark_gossiped(b.hash());
+        b.commitment().clone()
+    });
 
     // Sync with each peer in the batch.
     for peer in &batch {
@@ -2117,6 +2182,7 @@ async fn run_neighbor_sync_round(
                 last_commitment_by_peer,
                 ever_capable_peers,
                 sig_verify_attempts,
+                gossip_audit,
             )
             .await;
         } else {
@@ -2159,6 +2225,7 @@ async fn run_neighbor_sync_round(
                         last_commitment_by_peer,
                         ever_capable_peers,
                         sig_verify_attempts,
+                        gossip_audit,
                     )
                     .await;
                 }
@@ -2189,13 +2256,14 @@ async fn handle_sync_response(
     last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
     ever_capable_peers: &Arc<RwLock<HashSet<PeerId>>>,
     sig_verify_attempts: &Arc<RwLock<HashMap<PeerId, Instant>>>,
+    gossip_audit: &GossipAuditTrigger,
 ) {
-    // v12: ingest the peer's commitment if they piggybacked one on the
-    // response. Same verification as the request path
-    // (peer-id binding + signature). Drops forged commitments at the
-    // edge; honest commitments populate `last_commitment_by_peer` so
-    // the auditor can pin them on the next audit tick.
-    ingest_peer_commitment(
+    // Ingest the peer's commitment if they piggybacked one on the response.
+    // Same verification as the request path (peer-id binding + signature);
+    // forged commitments are dropped at the edge. A *changed* commitment here
+    // is a gossip-audit trigger just like on the request path — so a peer that
+    // only ever answers sync (never initiates) is still audited (ADR-0002).
+    if let Some(target) = ingest_peer_commitment(
         peer,
         resp.commitment.as_ref(),
         p2p_node,
@@ -2203,7 +2271,10 @@ async fn handle_sync_response(
         ever_capable_peers,
         sig_verify_attempts,
     )
-    .await;
+    .await
+    {
+        maybe_trigger_gossip_audit(gossip_audit, peer, target).await;
+    }
 
     // Record successful sync.
     {
@@ -3093,6 +3164,12 @@ async fn handle_failed_audit(
                 let mut provers_guard = recent_provers.write().await;
                 apply_audit_failure_credit_revocation(&mut provers_guard, challenged_peer, reason);
             }
+            crate::replication::events::trust_event(
+                &crate::replication::events::peer_hex(challenged_peer),
+                "application_failure",
+                config::AUDIT_FAILURE_TRUST_WEIGHT,
+                "audit_confirmed_failure",
+            );
             p2p_node
                 .report_trust_event(
                     challenged_peer,
@@ -3132,6 +3209,12 @@ async fn handle_audit_result(
                 let mut strikes = audit_timeout_strikes.write().await;
                 strikes.remove(challenged_peer);
             }
+            crate::replication::events::trust_event(
+                &crate::replication::events::peer_hex(challenged_peer),
+                "application_success",
+                REPLICATION_TRUST_WEIGHT,
+                "audit_passed",
+            );
             p2p_node
                 .report_trust_event(
                     challenged_peer,
@@ -3192,6 +3275,12 @@ async fn handle_audit_result(
                 }
             };
             if should_report {
+                crate::replication::events::trust_event(
+                    &crate::replication::events::peer_hex(peer),
+                    "application_failure",
+                    REPLICATION_TRUST_WEIGHT,
+                    "bootstrap_claim_abuse",
+                );
                 p2p_node
                     .report_trust_event(
                         peer,
@@ -3233,35 +3322,85 @@ enum AuditFailureAction {
     ConfirmedPenalize,
 }
 
+/// Upper bound on a peer's consecutive-timeout strike count. Must exceed the
+/// largest reachable adaptive threshold (base + `MAX_ADAPTIVE_TIMEOUT_GRACE`) so
+/// a genuinely non-responsive peer's count can always catch up to and cross an
+/// inflated threshold — otherwise capping at the base would make timeout
+/// penalties unreachable once the adaptive threshold rose (codex finding).
+const AUDIT_TIMEOUT_STRIKE_MAX: u32 = 64;
+
+/// Maximum extra grace the adaptive mechanism may add on top of the base
+/// threshold. Bounds how far a (possibly stale) set of timing-out peers can
+/// widen the window, so a small persistent failing cohort cannot push the
+/// threshold arbitrarily high and shield a bad node indefinitely.
+const MAX_ADAPTIVE_TIMEOUT_GRACE: u32 = 2 * config::AUDIT_TIMEOUT_STRIKE_THRESHOLD;
+
 /// Record an audit timeout for `peer` and return its new consecutive-timeout
-/// strike count, saturating at [`config::AUDIT_TIMEOUT_STRIKE_THRESHOLD`] so a
-/// long-lived non-storing peer cannot grow an unbounded counter between resets.
-/// A successful audit removes the peer's entry (the `Passed` arm of
-/// [`handle_audit_result`]), so only *consecutive* timeouts accumulate here.
+/// strike count, saturating at [`AUDIT_TIMEOUT_STRIKE_MAX`] (well above any
+/// reachable adaptive threshold). A successful audit removes the peer's entry
+/// (the `Passed` arm of [`handle_audit_result`]), so only *consecutive*
+/// timeouts accumulate here.
 fn record_audit_timeout_strike(strikes: &mut HashMap<PeerId, u32>, peer: &PeerId) -> u32 {
     let count = strikes.entry(*peer).or_insert(0);
-    *count = count
-        .saturating_add(1)
-        .min(config::AUDIT_TIMEOUT_STRIKE_THRESHOLD);
+    *count = count.saturating_add(1).min(AUDIT_TIMEOUT_STRIKE_MAX);
     *count
 }
 
-/// Whether a consecutive-timeout strike count is high enough to emit an
-/// `ApplicationFailure` trust event.
-fn timeout_strike_reaches_threshold(strikes: u32) -> bool {
-    strikes >= config::AUDIT_TIMEOUT_STRIKE_THRESHOLD
+/// The adaptive timeout-strike threshold for judging `peer` (ADR-0002 "Network
+/// Resilience"): `min(median of the OTHER timing-out peers' counts,
+/// MAX_ADAPTIVE_TIMEOUT_GRACE) + base threshold`.
+///
+/// In a healthy network almost no peer carries timeout strikes, so the median
+/// is 0 and the threshold is the base [`config::AUDIT_TIMEOUT_STRIKE_THRESHOLD`].
+/// During genuine disruption many *honest* peers time out together, lifting the
+/// median and widening the grace so the audit system does not pile onto a
+/// struggling network — but the widening is capped at `MAX_ADAPTIVE_TIMEOUT_GRACE`
+/// so a stale failing cohort cannot inflate it without bound.
+///
+/// `peer` is EXCLUDED from the median so a lone timing-out peer cannot raise its
+/// own grace bar. Combined with the map being fed ONLY by timeouts (deterministic
+/// failures never touch it), this closes self-inflation and bounds
+/// attacker-inflation of the grace window.
+fn adaptive_timeout_threshold(strikes: &HashMap<PeerId, u32>, peer: &PeerId) -> u32 {
+    let grace = median_timeout_strikes_excluding(strikes, peer).min(MAX_ADAPTIVE_TIMEOUT_GRACE);
+    grace.saturating_add(config::AUDIT_TIMEOUT_STRIKE_THRESHOLD)
+}
+
+/// Lower median of the current per-peer consecutive-timeout counts, excluding
+/// `peer`. No other peers → 0.
+fn median_timeout_strikes_excluding(strikes: &HashMap<PeerId, u32>, peer: &PeerId) -> u32 {
+    let mut counts: Vec<u32> = strikes
+        .iter()
+        .filter(|(p, _)| *p != peer)
+        .map(|(_, c)| *c)
+        .collect();
+    if counts.is_empty() {
+        return 0;
+    }
+    counts.sort_unstable();
+    // Lower median: for even-sized inputs take the lower of the two middle
+    // values ((len-1)/2), so the grace is conservative rather than inflated.
+    counts.get((counts.len() - 1) / 2).copied().unwrap_or(0)
+}
+
+/// Whether a peer's consecutive-timeout strike count reaches the (adaptive)
+/// threshold for emitting an `ApplicationFailure` trust event.
+fn timeout_strike_reaches_threshold(strikes: u32, threshold: u32) -> bool {
+    strikes >= threshold
 }
 
 /// Decide what to do about a confirmed audit failure. `timeout_strikes_after`
-/// is the peer's strike count after recording this event (only meaningful when
-/// `reason == Timeout`; pass 0 otherwise). Pure, so the integration-level
-/// decision can be asserted in tests with no networking.
+/// is the peer's strike count after recording this event and `timeout_threshold`
+/// the adaptive threshold to compare against (both only meaningful when
+/// `reason == Timeout`). Pure, so the integration-level decision can be asserted
+/// in tests with no networking.
 fn decide_audit_failure_action(
     reason: &AuditFailureReason,
     timeout_strikes_after: u32,
+    timeout_threshold: u32,
 ) -> AuditFailureAction {
     if matches!(reason, AuditFailureReason::Timeout) {
-        if timeout_strike_reaches_threshold(timeout_strikes_after) {
+        if timeout_strike_reaches_threshold(timeout_strikes_after, timeout_threshold) {
             AuditFailureAction::TimeoutPenalize
         } else {
             AuditFailureAction::TimeoutGrace
@@ -3274,19 +3413,22 @@ fn decide_audit_failure_action(
 /// Plan the response to a confirmed audit failure, performing the
 /// strike-selection glue in-process: a `Timeout` records a strike against
 /// `peer` (so consecutive timeouts accumulate) and is judged against the
-/// threshold; every other reason is a confirmed failure that does NOT touch the
-/// strike map. The caller owns the lock and performs the resulting I/O.
+/// adaptive threshold; every other reason is a confirmed failure that does NOT
+/// touch the strike map. The caller owns the lock and performs the resulting I/O.
 fn plan_failed_audit(
     reason: &AuditFailureReason,
     strikes: &mut HashMap<PeerId, u32>,
     peer: &PeerId,
 ) -> AuditFailureAction {
+    // Snapshot the adaptive threshold from the *other* peers' counts (excluding
+    // this peer), so a single peer's own timeouts cannot raise its own grace bar.
+    let threshold = adaptive_timeout_threshold(strikes, peer);
     let strikes_after = if matches!(reason, AuditFailureReason::Timeout) {
         record_audit_timeout_strike(strikes, peer)
     } else {
         0
     };
-    decide_audit_failure_action(reason, strikes_after)
+    decide_audit_failure_action(reason, strikes_after, threshold)
 }
 
 /// Whether a confirmed audit failure with this reason should revoke the
@@ -3320,8 +3462,191 @@ fn apply_audit_failure_credit_revocation(
 // `admit_bootstrap_hints` was consolidated into `admit_and_queue_hints`.
 
 // ---------------------------------------------------------------------------
-// Storage-bound audit (v12) — auditor-side commitment ingestion
+// Storage-bound audit (ADR-0002) — gossip trigger + auditor-side ingestion
 // ---------------------------------------------------------------------------
+
+/// State the gossip-audit trigger needs to spawn an audit. Bundled so the
+/// message handler passes one value instead of a long argument list; all
+/// fields are cheap `Arc` clones.
+#[derive(Clone)]
+struct GossipAuditTrigger {
+    p2p_node: Arc<P2PNode>,
+    config: Arc<ReplicationConfig>,
+    recent_provers: Arc<RwLock<RecentProvers>>,
+    sync_state: Arc<RwLock<NeighborSyncState>>,
+    audit_timeout_strikes: Arc<RwLock<HashMap<PeerId, u32>>>,
+    cooldown: Arc<RwLock<HashMap<PeerId, Instant>>>,
+}
+
+/// What a gossip ingest yields for the audit trigger: the commitment hash to
+/// pin and the `key_count` needed to size the response deadline from the actual
+/// `ceil(sqrt(N))` subtree (ADR-0002). Returned on every VALID gossip (changed
+/// or not) so a stable-keyset node stays auditable — not just on its first
+/// commitment.
+#[derive(Debug, Clone, Copy)]
+struct AuditTarget {
+    pin_hash: [u8; 32],
+    key_count: u32,
+}
+
+/// Per-peer audit cooldown check-and-stamp (ADR-0002 "occasional surprise
+/// exams, keeps load low"). Returns `true` if `peer` may be audited now (and
+/// stamps `now`), `false` if it was audited within
+/// `AUDIT_ON_GOSSIP_COOLDOWN_SECS`. Bounds the map under a flood of distinct
+/// peers. Pure over the passed map so the flood/cooldown behaviour is testable
+/// without a live node: a burst of gossips from one peer yields at most one
+/// `true` per cooldown window.
+fn cooldown_allows_audit(map: &mut HashMap<PeerId, Instant>, peer: &PeerId, now: Instant) -> bool {
+    let cooldown = Duration::from_secs(config::AUDIT_ON_GOSSIP_COOLDOWN_SECS);
+    let known = match map.get(peer) {
+        Some(&last) => {
+            if now.saturating_duration_since(last) < cooldown {
+                return false;
+            }
+            true
+        }
+        None => false,
+    };
+    // Bound the map under churn like its siblings (drop the oldest stamp) before
+    // admitting a brand-new peer.
+    if !known && map.len() >= MAX_LAST_COMMITMENT_BY_PEER {
+        if let Some(victim) = map.iter().min_by_key(|(_, &ts)| ts).map(|(p, _)| *p) {
+            map.remove(&victim);
+        }
+    }
+    map.insert(*peer, now);
+    true
+}
+
+/// The gossip-audit launch decision in ONE place so the ordering is shared
+/// between production and its test (ADR-0002 "occasional surprise exams").
+///
+/// Order matters and is the security-relevant property: the per-peer cooldown is
+/// checked-and-stamped FIRST, THEN the probability lottery (`lottery_wins`) is
+/// applied. If the lottery were sampled first, a gossip flood would re-roll it on
+/// every message until one won, multiplying audits. Because the cooldown is
+/// stamped before the lottery is consulted, a LOSING ticket still consumes the
+/// window — so each peer gets at most one audit lottery per cooldown window
+/// regardless of how often it gossips. Production calls this with
+/// `lottery_wins = gen_bool(AUDIT_ON_GOSSIP_PROBABILITY)`; the test calls it with
+/// a deterministic `lottery_wins`, so a reorder regression here fails the test.
+fn audit_launch_decision(
+    map: &mut HashMap<PeerId, Instant>,
+    peer: &PeerId,
+    now: Instant,
+    lottery_wins: bool,
+) -> bool {
+    // Gate 1: cooldown check-and-stamp (consumes the window even on a loss).
+    if !cooldown_allows_audit(map, peer, now) {
+        return false;
+    }
+    // Gate 2: the probability lottery.
+    lottery_wins
+}
+
+/// On a peer's *changed* gossiped commitment, maybe launch a subtree audit
+/// (ADR-0002): fire with probability `AUDIT_ON_GOSSIP_PROBABILITY`, subject to a
+/// per-peer cooldown, pinned to the just-ingested root. Detached so gossip
+/// handling is never blocked on a network round-trip.
+async fn maybe_trigger_gossip_audit(
+    trigger: &GossipAuditTrigger,
+    peer: &PeerId,
+    target: AuditTarget,
+) {
+    // The launch decision (cooldown-then-lottery ordering) lives in the pure
+    // `audit_launch_decision` so the ordering is shared with its test. Sample
+    // the lottery here, then let the helper apply it AFTER the cooldown stamp.
+    let now = Instant::now();
+    let lottery_wins = rand::thread_rng().gen_bool(config::AUDIT_ON_GOSSIP_PROBABILITY);
+    {
+        let mut map = trigger.cooldown.write().await;
+        if !audit_launch_decision(&mut map, peer, now, lottery_wins) {
+            return;
+        }
+    }
+
+    let trigger = trigger.clone();
+    let peer = *peer;
+    tokio::spawn(async move {
+        let credit = audit::AuditCredit {
+            recent_provers: &trigger.recent_provers,
+        };
+        let result = audit::run_subtree_audit(
+            &trigger.p2p_node,
+            &trigger.config,
+            &peer,
+            target.pin_hash,
+            target.key_count,
+            Some(&credit),
+        )
+        .await;
+        handle_audit_result(
+            &result,
+            &trigger.p2p_node,
+            &trigger.sync_state,
+            &trigger.recent_provers,
+            &trigger.audit_timeout_strikes,
+            &trigger.config,
+        )
+        .await;
+    });
+}
+
+/// Atomic check-and-stamp of the per-peer commitment sig-verify rate limit.
+///
+/// Returns `true` if a signature verify is allowed now (and stamps the attempt
+/// time), `false` if the peer is within [`COMMITMENT_SIG_VERIFY_MIN_INTERVAL`]
+/// of its last attempt. Holds one write lock across the decision so two
+/// concurrent ingests from the same peer cannot both pass. Stamps BEFORE the
+/// caller's expensive verify so a slow/failed verify still rate-limits the next
+/// message. Bounds the map under a flood of distinct peer ids.
+async fn sig_verify_rate_limit_ok(
+    sig_verify_attempts: &Arc<RwLock<HashMap<PeerId, Instant>>>,
+    source: &PeerId,
+    now: Instant,
+) -> bool {
+    let mut attempts = sig_verify_attempts.write().await;
+    if let Some(&last) = attempts.get(source) {
+        if now.saturating_duration_since(last) < COMMITMENT_SIG_VERIFY_MIN_INTERVAL {
+            return false;
+        }
+    }
+    if attempts.len() >= MAX_LAST_COMMITMENT_BY_PEER && !attempts.contains_key(source) {
+        if let Some(victim) = attempts.iter().min_by_key(|(_, &ts)| ts).map(|(p, _)| *p) {
+            attempts.remove(&victim);
+        }
+    }
+    attempts.insert(*source, now);
+    true
+}
+
+/// Emit a v12 `gossip_ingest` reject record (no-op without the
+/// `v12-event-log` feature). Reads the current cache size for the record so the
+/// gate decisions stay one line each at the call sites.
+async fn record_ingest_reject(
+    source: &PeerId,
+    reason: &str,
+    last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
+) {
+    crate::replication::events::gossip_ingest(
+        &crate::replication::events::peer_hex(source),
+        false,
+        reason,
+        last_commitment_by_peer.read().await.len(),
+    );
+}
+
+/// Emit a v12 `gossip_ingest` accept record (no-op without the
+/// `v12-event-log` feature). Kept one-line at the call site like its reject
+/// sibling so `ingest_peer_commitment` stays readable.
+fn record_ingest_accept(source: &PeerId, cache_size: usize) {
+    crate::replication::events::gossip_ingest(
+        &crate::replication::events::peer_hex(source),
+        true,
+        "accepted",
+        cache_size,
+    );
+}
 
 /// Verify + store an inbound commitment from a gossip peer.
 ///
@@ -3348,7 +3673,14 @@ fn apply_audit_failure_credit_revocation(
 /// silent drops — gossip is best-effort and a malformed commitment from
 /// one peer should not affect anything else.
 ///
-/// Returns `true` iff the commitment was stored.
+/// Returns `Some(AuditTarget)` whenever a VALID commitment was stored (whether
+/// or not its root changed), so the caller can run a probabilistic,
+/// cooldown-gated subtree audit. Returning on *every* valid gossip — not only
+/// changed ones — is deliberate (ADR-0002): a node with a stable key set keeps
+/// being auditable, so it cannot pass one audit and then delete data while
+/// re-gossiping the same root forever. The cooldown + probability bound the
+/// audit frequency. Returns `None` only if the commitment was dropped (failed a
+/// gate) or there is nothing to pin.
 async fn ingest_peer_commitment(
     source: &PeerId,
     commitment: Option<&StorageCommitment>,
@@ -3356,36 +3688,33 @@ async fn ingest_peer_commitment(
     last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
     ever_capable_peers: &Arc<RwLock<HashSet<PeerId>>>,
     sig_verify_attempts: &Arc<RwLock<HashMap<PeerId, Instant>>>,
-) -> bool {
+) -> Option<AuditTarget> {
     let Some(c) = commitment else {
-        // Commitment-downgrade signal: a peer that previously gossiped
-        // a commitment but now gossips None looks like a downgrade
-        // attempt to drop back onto the weaker legacy audit path.
-        //
-        // We do NOT clear the cached `last_commitment` here. Clearing it
-        // would make the §3 audit shield (`is_capable && !has_current_
-        // commitment`) fire and skip the peer entirely — turning a
-        // downgrade into an audit evasion. Instead we keep the last
-        // commitment pinned so the next audit tick still challenges the
-        // peer under it: if they have genuinely dropped the data, the
-        // audit fails and the §5 `UnknownCommitmentHash` path invalidates
-        // their `recent_provers` credit. The sticky `commitment_capable`
-        // flag (and `ever_capable_peers`) keep them on the v12 path; the
-        // existing audit→§5 loop is the single mechanism that revokes
-        // credit, so we don't add a second one here.
-        if last_commitment_by_peer
-            .read()
-            .await
-            .get(source)
-            .is_some_and(|rec| rec.commitment_capable && rec.last_commitment.is_some())
-        {
-            warn!(
-                "ingest_peer_commitment: commitment-capable peer {source} sent None \
-                 commitment (downgrade attempt; keeping last commitment pinned so the \
-                 next audit re-challenges under it)"
-            );
+        // Commitment-downgrade signal: a capable peer that previously gossiped a
+        // commitment but now gossips None is trying to drop off the audit path.
+        // We keep the cached commitment pinned AND return it as an audit target
+        // so this gossip still schedules a subtree audit against the peer's last
+        // known commitment. If it genuinely dropped the data, the audit fails
+        // (or it rejects the pin → confirmed failure). There is no periodic
+        // audit tick anymore, so the trigger MUST fire here or the downgrade
+        // would never be re-challenged.
+        if let Some(rec) = last_commitment_by_peer.read().await.get(source) {
+            if rec.commitment_capable {
+                if let Some(last) = rec.last_commitment.as_ref() {
+                    if let Some(pin) = commitment_hash(last) {
+                        warn!(
+                            "ingest_peer_commitment: commitment-capable peer {source} sent None \
+                             (downgrade attempt); auditing against its last cached commitment"
+                        );
+                        return Some(AuditTarget {
+                            pin_hash: pin,
+                            key_count: last.key_count,
+                        });
+                    }
+                }
+            }
         }
-        return false;
+        return None;
     };
     // RT-membership gate: only accept commitments from peers in our
     // routing table. Off-RT senders (sybils, drive-by relays) cannot
@@ -3397,7 +3726,8 @@ async fn ingest_peer_commitment(
     // piggyback.
     if !p2p_node.dht_manager().is_in_routing_table(source).await {
         debug!("ingest_peer_commitment: source {source} not in routing table (dropped)");
-        return false;
+        record_ingest_reject(source, "rt_gate", last_commitment_by_peer).await;
+        return None;
     }
     // Peer-id binding: the commitment's claimed sender must match the
     // authenticated transport peer (`source`). Defeats relay/replay
@@ -3409,7 +3739,8 @@ async fn ingest_peer_commitment(
             "ingest_peer_commitment: sender_peer_id mismatch from {source} \
              (dropped, possible relay attempt)"
         );
-        return false;
+        record_ingest_reject(source, "peer_id_mismatch", last_commitment_by_peer).await;
+        return None;
     }
     // Peer-id to embedded-pubkey binding: saorsa-core derives PeerId as
     // BLAKE3(pubkey_bytes). Without this check, a responder could sign
@@ -3421,7 +3752,8 @@ async fn ingest_peer_commitment(
             "ingest_peer_commitment: embedded pubkey does not hash to claimed peer_id for \
              {source} (dropped, throwaway-key attack)"
         );
-        return false;
+        record_ingest_reject(source, "pubkey_bind_mismatch", last_commitment_by_peer).await;
+        return None;
     }
     // §2 step 3 + §11 DoS: rate-limit per-peer to at most one ML-DSA
     // signature verify per `COMMITMENT_SIG_VERIFY_MIN_INTERVAL`. A
@@ -3437,38 +3769,13 @@ async fn ingest_peer_commitment(
     // letting a flood of invalid-but-structurally-plausible gossips
     // burn CPU (codex round-13 finding).
     let now = Instant::now();
-    // Atomic check-and-stamp under a single write lock. Codex round-14
-    // found that read-then-write under separate locks let two
-    // concurrent ingests from the same peer both miss the check and
-    // both reach ML-DSA verify within the 60s window. Holding the
-    // write lock across the rate-limit decision closes that race.
-    // The lock is held only for a hash-map lookup + insert (microseconds),
-    // not across the expensive verify itself.
-    {
-        let mut attempts = sig_verify_attempts.write().await;
-        if let Some(&last) = attempts.get(source) {
-            if now.saturating_duration_since(last) < COMMITMENT_SIG_VERIFY_MIN_INTERVAL {
-                debug!(
-                    "ingest_peer_commitment: rate-limited sig verify from {source} \
-                     (< {COMMITMENT_SIG_VERIFY_MIN_INTERVAL:?} since last attempt); dropped"
-                );
-                return false;
-            }
-        }
-        // Hard-cap the map size so a wide flood of distinct peer ids
-        // cannot grow it unbounded. Sized at the same cap as
-        // last_commitment_by_peer.
-        if attempts.len() >= MAX_LAST_COMMITMENT_BY_PEER && !attempts.contains_key(source) {
-            // Drop the entry with the oldest timestamp to make room
-            // for a fresh attempt (preserves DoS-cap semantics).
-            if let Some(victim) = attempts.iter().min_by_key(|(_, &ts)| ts).map(|(p, _)| *p) {
-                attempts.remove(&victim);
-            }
-        }
-        // Stamp BEFORE the verify so even if verify panics or is very
-        // slow, a concurrent message from the same peer is rejected
-        // by the 60s cap when it reaches this critical section.
-        attempts.insert(*source, now);
+    if !sig_verify_rate_limit_ok(sig_verify_attempts, source, now).await {
+        debug!(
+            "ingest_peer_commitment: rate-limited sig verify from {source} \
+             (< {COMMITMENT_SIG_VERIFY_MIN_INTERVAL:?} since last attempt); dropped"
+        );
+        record_ingest_reject(source, "sig_verify_rate_limited", last_commitment_by_peer).await;
+        return None;
     }
     // Signature verify, using the public key embedded in the commitment
     // itself. The pubkey is bound by the signature payload (see
@@ -3479,8 +3786,11 @@ async fn ingest_peer_commitment(
             "ingest_peer_commitment: signature did not verify under embedded key for {source} \
              (dropped, forged commitment)"
         );
-        return false;
+        record_ingest_reject(source, "sig_invalid", last_commitment_by_peer).await;
+        return None;
     }
+    // The new commitment's hash, used to store and to pin for the audit target.
+    let new_hash = commitment_hash(c);
     let mut map = last_commitment_by_peer.write().await;
     // Sybil/churn cap: if we're at the hard cap AND this is a new peer,
     // evict an arbitrary existing entry to make room. Updates for peers
@@ -3509,6 +3819,9 @@ async fn ingest_peer_commitment(
             r.commitment_capable = true; // sticky-redundant but explicit
         })
         .or_insert_with(|| PeerCommitmentRecord::from_verified(c.clone(), now));
+    let cache_size = map.len();
+    drop(map);
+    record_ingest_accept(source, cache_size);
     // Record the sticky "ever v12-capable" bit in a set independent of
     // `last_commitment_by_peer` (whose entries can be evicted by
     // `PeerRemoved` and the sybil cap). This is what the §3 audit
@@ -3531,7 +3844,14 @@ async fn ingest_peer_commitment(
             );
         }
     }
-    true
+    // Return an audit target for EVERY valid stored commitment (changed or
+    // not), so the caller's cooldown+probability-gated trigger keeps a
+    // stable-keyset peer auditable over time (ADR-0002). Only a serialization
+    // failure (new_hash == None, unreachable for a real commitment) yields None.
+    new_hash.map(|pin_hash| AuditTarget {
+        pin_hash,
+        key_count: c.key_count,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3557,6 +3877,17 @@ async fn rebuild_and_rotate_commitment(
     p2p: &Arc<P2PNode>,
 ) -> Result<()> {
     use saorsa_pqc::api::sig::{MlDsaSecretKey, MlDsaVariant};
+
+    // Adversary `silent` mode (testnet-only, never in production): never build
+    // or rotate a commitment, so this node accepts puts but NEVER gossips a
+    // StorageCommitment. The gossip piggyback path emits `commitment: None`, so
+    // the node is never credited as a holder (§3/§6) and earns no reward — the
+    // bootstrap-claim-shield evasion this attack tests. No-op without the
+    // `adversary` feature.
+    #[cfg(feature = "adversary")]
+    if crate::adversary::is_silent() {
+        return Ok(());
+    }
 
     let keys = storage
         .all_keys()
@@ -3636,12 +3967,44 @@ async fn rebuild_and_rotate_commitment(
         .map_err(|e| Error::Crypto(format!("commitment build: load sk: {e}")))?;
     let pk_bytes = identity.public_key().as_bytes().to_vec();
     let peer_id_bytes = *p2p.peer_id().as_bytes();
+
+    // Adversary `throwaway-key` mode (testnet-only, never in production): sign
+    // the commitment with a freshly-generated SIDE keypair while keeping the
+    // REAL `peer_id_bytes` claimed. The embedded `sender_public_key` is then the
+    // side pubkey, whose BLAKE3 does NOT hash to the claimed peer id, so the
+    // auditor's gossip-ingest pubkey↔peer_id binding gate (gate 3) drops the
+    // commitment and the peer never enters `last_commitment_by_peer`. If side
+    // keygen fails we fall back to the honest keys (no panic). No-op without the
+    // `adversary` feature.
+    #[cfg(feature = "adversary")]
+    let (sk, pk_bytes) = if crate::adversary::is_throwaway_key() {
+        match saorsa_pqc::api::sig::ml_dsa_65().generate_keypair() {
+            Ok((side_public, side_secret)) => {
+                warn!(
+                    "adversary throwaway-key: signing commitment with a side keypair while \
+                     claiming the real peer id (expect auditor pubkey-binding rejection)"
+                );
+                (side_secret, side_public.to_bytes())
+            }
+            Err(e) => {
+                warn!("adversary throwaway-key: side keygen failed ({e}); using honest keys");
+                (sk, pk_bytes)
+            }
+        }
+    } else {
+        (sk, pk_bytes)
+    };
+
     let built = commitment_state::BuiltCommitment::build(entries, &peer_id_bytes, &sk, &pk_bytes)
         .map_err(|e| Error::Crypto(format!("commitment build: {e}")))?;
 
     let hash = hex::encode(built.hash());
     let key_count = built.commitment().key_count;
-    state.rotate(built);
+    let retained_slots = {
+        state.rotate(built);
+        state.retained_slot_count()
+    };
+    crate::replication::events::commitment_rotated(&hash, key_count, retained_slots);
     info!("Storage commitment rotated: hash={hash} key_count={key_count}");
     Ok(())
 }
@@ -3650,15 +4013,17 @@ async fn rebuild_and_rotate_commitment(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::{
-        apply_audit_failure_credit_revocation, audit_failure_clears_bootstrap_claim,
-        audit_failure_revokes_holder_credit, config, decide_audit_failure_action,
-        plan_failed_audit, record_audit_timeout_strike, timeout_strike_reaches_threshold,
-        AuditFailureAction,
+        adaptive_timeout_threshold, apply_audit_failure_credit_revocation,
+        audit_failure_clears_bootstrap_claim, audit_failure_revokes_holder_credit,
+        audit_launch_decision, config, cooldown_allows_audit, decide_audit_failure_action,
+        median_timeout_strikes_excluding, plan_failed_audit, record_audit_timeout_strike,
+        timeout_strike_reaches_threshold, AuditFailureAction, AUDIT_TIMEOUT_STRIKE_MAX,
     };
     use crate::replication::recent_provers::RecentProvers;
     use crate::replication::types::AuditFailureReason;
     use saorsa_core::identity::PeerId;
     use std::collections::HashMap;
+    use std::time::Duration;
     use std::time::Instant;
 
     fn test_peer(b: u8) -> PeerId {
@@ -3693,9 +4058,10 @@ mod tests {
     fn single_timeout_then_success_emits_no_failure_and_resets() {
         let peer = strike_peer(1);
         let mut strikes: HashMap<PeerId, u32> = HashMap::new();
+        let base = config::AUDIT_TIMEOUT_STRIKE_THRESHOLD;
         let after_one = record_audit_timeout_strike(&mut strikes, &peer);
         assert_eq!(after_one, 1);
-        assert!(!timeout_strike_reaches_threshold(after_one));
+        assert!(!timeout_strike_reaches_threshold(after_one, base));
         strikes.remove(&peer);
         assert!(!strikes.contains_key(&peer));
     }
@@ -3709,12 +4075,321 @@ mod tests {
         for i in 1..=n {
             last = record_audit_timeout_strike(&mut strikes, &peer);
             if i < n {
-                assert!(!timeout_strike_reaches_threshold(last));
+                assert!(!timeout_strike_reaches_threshold(last, n));
             }
         }
-        assert!(timeout_strike_reaches_threshold(last));
-        // Saturates at the threshold — no unbounded growth.
-        assert_eq!(record_audit_timeout_strike(&mut strikes, &peer), n);
+        assert!(timeout_strike_reaches_threshold(last, n));
+        // The count keeps climbing past the base threshold (so it can also
+        // cross a higher *adaptive* threshold), but is bounded by the strike
+        // cap — no unbounded growth.
+        let mut c = last;
+        for _ in 0..200 {
+            c = record_audit_timeout_strike(&mut strikes, &peer);
+        }
+        assert_eq!(
+            c,
+            super::AUDIT_TIMEOUT_STRIKE_MAX,
+            "count saturates at the max cap"
+        );
+        assert!(c > n, "count must be able to exceed the base threshold");
+    }
+
+    // ADR-0002 Network Resilience: adaptive timeout threshold.
+
+    #[test]
+    fn median_timeout_strikes_basics() {
+        let target = strike_peer(99);
+        let mut strikes: HashMap<PeerId, u32> = HashMap::new();
+        // No other peers → 0 (healthy network, threshold == base).
+        assert_eq!(median_timeout_strikes_excluding(&strikes, &target), 0);
+        strikes.insert(strike_peer(1), 1);
+        strikes.insert(strike_peer(2), 3);
+        strikes.insert(strike_peer(3), 5);
+        // Sorted [1,3,5], lower-median index 1 → 3.
+        assert_eq!(median_timeout_strikes_excluding(&strikes, &target), 3);
+    }
+
+    // ADVERSARIAL (ADR point e + sybil-inflation bound). Two invariants the
+    // existing suite leaves unpinned:
+    //  1. EVEN-count inputs must take the LOWER of the two middle values. The
+    //     existing basics test only feeds an odd-length cohort, so an
+    //     implementation that used `len/2` (upper median) would still pass it.
+    //     Here [1,4] -> lower median 1 (not 4) and [2,4,6,8] -> 4 (not 6).
+    //  2. A sybil cohort pinned at the *strike cap* (the most an attacker could
+    //     ever drive fabricated peers to) STILL cannot push the grace past
+    //     MAX_ADAPTIVE_TIMEOUT_GRACE: the threshold saturates at base + max
+    //     grace regardless of how high or how numerous the cohort is.
+    // FLIPS IF: median switches to the upper element on even input, or the
+    // grace clamp (`.min(MAX_ADAPTIVE_TIMEOUT_GRACE)`) is removed.
+    #[test]
+    fn even_count_takes_lower_median_and_sybil_cohort_cannot_exceed_grace_bound() {
+        let target = strike_peer(150);
+
+        // Even count == 2: lower of [1, 4] is 1.
+        let mut two: HashMap<PeerId, u32> = HashMap::new();
+        two.insert(strike_peer(1), 1);
+        two.insert(strike_peer(2), 4);
+        assert_eq!(
+            median_timeout_strikes_excluding(&two, &target),
+            1,
+            "even-count median must take the LOWER middle value (1), not the upper (4)"
+        );
+
+        // Even count == 4: sorted [2,4,6,8], lower median index (4-1)/2 = 1 → 4.
+        let mut four: HashMap<PeerId, u32> = HashMap::new();
+        for (i, v) in [2u32, 4, 6, 8].into_iter().enumerate() {
+            four.insert(strike_peer(10 + i as u8), v);
+        }
+        assert_eq!(
+            median_timeout_strikes_excluding(&four, &target),
+            4,
+            "even-count median must be the lower middle (4), not the upper (6)"
+        );
+
+        // Sybil cohort pinned at the strike CAP — the strongest inflation an
+        // attacker could mount — must not lift the threshold past base + max
+        // grace. Try several cohort sizes (odd and even) to be sure.
+        for cohort in [2u8, 5, 8, 20] {
+            let mut strikes: HashMap<PeerId, u32> = HashMap::new();
+            for i in 0..cohort {
+                strikes.insert(strike_peer(50 + i), super::AUDIT_TIMEOUT_STRIKE_MAX);
+            }
+            let threshold = adaptive_timeout_threshold(&strikes, &target);
+            assert_eq!(
+                threshold,
+                config::AUDIT_TIMEOUT_STRIKE_THRESHOLD + super::MAX_ADAPTIVE_TIMEOUT_GRACE,
+                "a sybil cohort at the strike cap (size {cohort}) must saturate the grace at \
+                 the bound, never exceed it"
+            );
+        }
+
+        // And even at the bounded-but-inflated threshold, a genuinely
+        // non-responsive target can still cross it (cap > max reachable
+        // threshold), so the bound never shields a bad node forever.
+        let mut strikes: HashMap<PeerId, u32> = HashMap::new();
+        for i in 0..8u8 {
+            strikes.insert(strike_peer(80 + i), super::AUDIT_TIMEOUT_STRIKE_MAX);
+        }
+        let threshold = adaptive_timeout_threshold(&strikes, &target);
+        let mut c = 0;
+        for _ in 0..(threshold + 5) {
+            c = record_audit_timeout_strike(&mut strikes, &target);
+        }
+        assert!(
+            timeout_strike_reaches_threshold(c, threshold),
+            "target must still cross the bounded inflated threshold ({c} vs {threshold})"
+        );
+    }
+
+    #[test]
+    fn lone_timing_out_peer_does_not_inflate_its_own_grace() {
+        // The peer under judgement is excluded from the median, so a single bad
+        // peer (the common case) is judged against the base threshold and caught
+        // — it cannot raise its own bar as its strike count climbs.
+        let bad = strike_peer(7);
+        let mut strikes: HashMap<PeerId, u32> = HashMap::new();
+        strikes.insert(bad, 5); // its own large count must not count
+        assert_eq!(
+            adaptive_timeout_threshold(&strikes, &bad),
+            config::AUDIT_TIMEOUT_STRIKE_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn widespread_timeouts_widen_the_grace() {
+        // Genuine disruption: many OTHER honest peers carry timeout strikes. The
+        // median rises, so the threshold for any given peer widens beyond the
+        // base — the audit system does not pile onto a struggling network.
+        let target = strike_peer(100);
+        let mut strikes: HashMap<PeerId, u32> = HashMap::new();
+        for i in 0..9u8 {
+            strikes.insert(strike_peer(i), 4);
+        }
+        assert_eq!(
+            adaptive_timeout_threshold(&strikes, &target),
+            4 + config::AUDIT_TIMEOUT_STRIKE_THRESHOLD
+        );
+        assert!(
+            adaptive_timeout_threshold(&strikes, &target) > config::AUDIT_TIMEOUT_STRIKE_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn adaptive_grace_only_responds_to_timeouts_not_deterministic_failures() {
+        // The strike map is fed ONLY by timeouts (plan_failed_audit records a
+        // strike for Timeout and never for confirmed failures). So a flood of
+        // deterministic failures cannot inflate the median to buy grace.
+        let target = strike_peer(101);
+        let mut strikes: HashMap<PeerId, u32> = HashMap::new();
+        // Many confirmed (non-timeout) failures: these must NOT touch the map.
+        for i in 0..9u8 {
+            let action = plan_failed_audit(
+                &AuditFailureReason::DigestMismatch,
+                &mut strikes,
+                &strike_peer(i),
+            );
+            assert_eq!(action, AuditFailureAction::ConfirmedPenalize);
+        }
+        assert!(
+            strikes.is_empty(),
+            "deterministic failures must not record strikes"
+        );
+        // Threshold stays at the base — an attacker cannot widen grace by
+        // failing audits on purpose.
+        assert_eq!(
+            adaptive_timeout_threshold(&strikes, &target),
+            config::AUDIT_TIMEOUT_STRIKE_THRESHOLD
+        );
+    }
+
+    // ADR-0002: "occasional surprise exams, keeps load low" — the per-peer
+    // cooldown must collapse a gossip flood into at most one audit per window.
+
+    #[test]
+    fn gossip_flood_yields_at_most_one_audit_per_cooldown_window() {
+        let peer = strike_peer(1);
+        let mut map: HashMap<PeerId, Instant> = HashMap::new();
+        let t0 = Instant::now();
+        // First gossip in the window passes; a burst of further gossips at the
+        // same instant are all suppressed.
+        assert!(cooldown_allows_audit(&mut map, &peer, t0));
+        let mut passed = 1;
+        for _ in 0..100 {
+            if cooldown_allows_audit(&mut map, &peer, t0) {
+                passed += 1;
+            }
+        }
+        assert_eq!(
+            passed, 1,
+            "a flood at one instant must trigger exactly one audit"
+        );
+    }
+
+    // ADR-0002 ordering invariant: `maybe_trigger_gossip_audit` stamps the
+    // per-peer cooldown BEFORE the probability lottery, so a LOSING ticket still
+    // consumes the window. This is the property the isolated cooldown tests above
+    // cannot see: they never sample the lottery, so a regression that reordered
+    // the gates (sample probability first, only stamp the cooldown on a win)
+    // would still pass them while breaking flood-resistance: a flood would then
+    // re-roll the lottery on EVERY message until one won, multiplying audits.
+    //
+    // We model the exact production gate order (cooldown-then-lottery) with a
+    // lottery driven by a fixed outcome instead of `gen_bool(..)`. The first
+    // message LOSES the lottery; the remaining flood messages all WIN. With the
+    // production order, the losing first ticket burns the window and every later
+    // winner in the same window is blocked, so there are 0 audits this window. If
+    // the gates were flipped, the second message's winning ticket would slip
+    // through. The window only reopens after the cooldown elapses.
+    //
+    // FLIPS IF: the lottery is sampled before `cooldown_allows_audit` (a losing
+    // ticket no longer consumes the window), re-enabling a flood-amplified audit
+    // storm.
+    #[test]
+    fn losing_lottery_still_consumes_cooldown_window() {
+        // Faithful re-implementation of the two gates in
+        // `maybe_trigger_gossip_audit`, with the lottery outcome made
+        // deterministic instead of `rand::thread_rng().gen_bool(..)`.
+        // Calls the SHIPPED `audit_launch_decision` (the same function
+        // `maybe_trigger_gossip_audit` uses), so a reorder of the two gates in
+        // production fails this test — not a local reimplementation.
+        let peer = strike_peer(3);
+        let mut map: HashMap<PeerId, Instant> = HashMap::new();
+        let t0 = Instant::now();
+
+        // First flooded message at t0 LOSES the lottery, but the cooldown is
+        // stamped BEFORE the lottery is consulted, so the window is now consumed.
+        assert!(
+            !audit_launch_decision(&mut map, &peer, t0, false),
+            "a losing ticket launches no audit"
+        );
+
+        // 99 more flooded messages at the same instant would all WIN the lottery,
+        // yet every one must be blocked by the cooldown the loser already stamped.
+        // (If production sampled the lottery FIRST, these would each get a fresh
+        // roll and audits would multiply — this assertion catches that reorder.)
+        let mut audits = 0;
+        for _ in 0..99 {
+            if audit_launch_decision(&mut map, &peer, t0, true) {
+                audits += 1;
+            }
+        }
+        assert_eq!(
+            audits, 0,
+            "a losing first ticket must consume the window so no later flooded \
+             message in the same window can audit"
+        );
+
+        // The window only reopens after the cooldown elapses; the next winning
+        // ticket then launches exactly one audit.
+        let after = t0 + Duration::from_secs(config::AUDIT_ON_GOSSIP_COOLDOWN_SECS + 1);
+        assert!(
+            audit_launch_decision(&mut map, &peer, after, true),
+            "after the cooldown a winning ticket audits again"
+        );
+    }
+
+    #[test]
+    fn cooldown_lets_audit_through_after_the_window() {
+        let peer = strike_peer(2);
+        let mut map: HashMap<PeerId, Instant> = HashMap::new();
+        let t0 = Instant::now();
+        assert!(cooldown_allows_audit(&mut map, &peer, t0));
+        // Within the window: suppressed.
+        let within = t0 + Duration::from_secs(config::AUDIT_ON_GOSSIP_COOLDOWN_SECS - 1);
+        assert!(!cooldown_allows_audit(&mut map, &peer, within));
+        // Past the window: allowed again.
+        let after = t0 + Duration::from_secs(config::AUDIT_ON_GOSSIP_COOLDOWN_SECS + 1);
+        assert!(cooldown_allows_audit(&mut map, &peer, after));
+    }
+
+    #[test]
+    fn cooldown_is_per_peer_independent() {
+        let mut map: HashMap<PeerId, Instant> = HashMap::new();
+        let t0 = Instant::now();
+        // Different peers each get their own first-audit pass at the same instant.
+        for i in 0..20u8 {
+            assert!(
+                cooldown_allows_audit(&mut map, &strike_peer(i), t0),
+                "peer {i} should be auditable independently"
+            );
+        }
+    }
+
+    #[test]
+    fn inflated_adaptive_threshold_is_still_reachable_and_bounded() {
+        // codex finding: when the median lifts the threshold above the base, a
+        // genuinely non-responsive peer's strike count must still be able to
+        // reach it (the count is no longer capped at the base). And the grace
+        // widening itself is bounded so it can't shield a bad node forever.
+        let target = strike_peer(200);
+        let mut strikes: HashMap<PeerId, u32> = HashMap::new();
+        // A cohort of other peers each at a high strike count.
+        for i in 0..9u8 {
+            strikes.insert(strike_peer(i), 10);
+        }
+        let threshold = adaptive_timeout_threshold(&strikes, &target);
+        // Grace is capped, so the threshold cannot exceed base + max grace.
+        assert!(
+            threshold <= config::AUDIT_TIMEOUT_STRIKE_THRESHOLD + super::MAX_ADAPTIVE_TIMEOUT_GRACE
+        );
+        assert!(threshold > config::AUDIT_TIMEOUT_STRIKE_THRESHOLD);
+        // The target peer can accumulate strikes past that inflated threshold.
+        let mut c = 0;
+        for _ in 0..threshold + 5 {
+            c = record_audit_timeout_strike(&mut strikes, &target);
+        }
+        assert!(
+            timeout_strike_reaches_threshold(c, threshold),
+            "a persistent peer must be able to cross the inflated threshold ({c} vs {threshold})"
+        );
+    }
+
+    #[test]
+    fn audit_on_gossip_constants_match_adr() {
+        // Tripwire on the ADR-locked tunables.
+        assert_eq!(config::AUDIT_SPOTCHECK_COUNT, 8);
+        assert!((config::AUDIT_ON_GOSSIP_PROBABILITY - 0.2).abs() < f64::EPSILON);
+        assert_eq!(config::AUDIT_ON_GOSSIP_COOLDOWN_SECS, 30 * 60);
     }
 
     // (d) A confirmed storage-integrity failure penalizes immediately and
@@ -3735,11 +4410,12 @@ mod tests {
     #[test]
     fn e2e_honest_intermittent_timeouts_never_penalized() {
         let peer = strike_peer(10);
+        let base = config::AUDIT_TIMEOUT_STRIKE_THRESHOLD;
         let mut strikes: HashMap<PeerId, u32> = HashMap::new();
         for _ in 0..10 {
             let after = record_audit_timeout_strike(&mut strikes, &peer);
             assert_eq!(
-                decide_audit_failure_action(&AuditFailureReason::Timeout, after),
+                decide_audit_failure_action(&AuditFailureReason::Timeout, after, base),
                 AuditFailureAction::TimeoutGrace
             );
             strikes.remove(&peer);
@@ -3759,7 +4435,7 @@ mod tests {
         let mut penalized_at = None;
         for tick in 1..=(threshold + 2) {
             let after = record_audit_timeout_strike(&mut strikes, &peer);
-            if decide_audit_failure_action(&AuditFailureReason::Timeout, after)
+            if decide_audit_failure_action(&AuditFailureReason::Timeout, after, threshold)
                 == AuditFailureAction::TimeoutPenalize
                 && penalized_at.is_none()
             {
@@ -3804,6 +4480,81 @@ mod tests {
             );
         }
         assert!(strikes.is_empty());
+    }
+
+    // ADR-0002 "Accounting and False Positives", adversarial: a DETERMINISTIC
+    // failure is acted on the FIRST time it occurs, "regardless of network
+    // conditions". Here the strike map is pre-loaded with many *other* peers
+    // timing out, which inflates the adaptive timeout grace to its cap — the
+    // most forgiving the network ever gets. Under that maximally-relaxed
+    // window:
+    //   - a brand-new peer's FIRST deterministic failure (DigestMismatch /
+    //     Rejected / MalformedResponse) STILL returns ConfirmedPenalize, never
+    //     a grace lane, and never touches the strike map; while
+    //   - that same peer's FIRST timeout is only TimeoutGrace.
+    // This proves the inflated grace is the timeout-only lane and can NEVER be
+    // weaponized to buy a deterministic failure even one round of delay.
+    // FLIPS IF: deterministic failures start consulting the strike threshold,
+    // or ConfirmedPenalize is collapsed into a timeout action.
+    #[test]
+    fn deterministic_failure_penalizes_first_time_under_inflated_grace() {
+        let mut strikes: HashMap<PeerId, u32> = HashMap::new();
+        // Saturate the adaptive grace: many other peers each carrying a high
+        // consecutive-timeout count, so the median (and thus the grace) is
+        // pushed to its MAX cap for any newly-judged peer.
+        for b in 100..150u8 {
+            let other = strike_peer(b);
+            for _ in 0..AUDIT_TIMEOUT_STRIKE_MAX {
+                record_audit_timeout_strike(&mut strikes, &other);
+            }
+        }
+        let victim = strike_peer(7);
+        // Sanity: the grace seen by the victim is genuinely inflated above base.
+        let inflated = adaptive_timeout_threshold(&strikes, &victim);
+        assert!(
+            inflated > config::AUDIT_TIMEOUT_STRIKE_THRESHOLD,
+            "test precondition: grace must be inflated, got {inflated}"
+        );
+
+        // First deterministic failure of each kind -> ConfirmedPenalize on
+        // occurrence #1, and the victim is never inserted into the strike map.
+        for reason in [
+            AuditFailureReason::DigestMismatch,
+            AuditFailureReason::Rejected,
+            AuditFailureReason::MalformedResponse,
+        ] {
+            let action = plan_failed_audit(&reason, &mut strikes, &victim);
+            assert_eq!(
+                action,
+                AuditFailureAction::ConfirmedPenalize,
+                "{reason:?} must penalize on the first occurrence regardless of grace"
+            );
+            assert_ne!(
+                action,
+                AuditFailureAction::TimeoutPenalize,
+                "a deterministic failure must NOT be routed through the (eviction-gated) \
+                 timeout-penalize lane"
+            );
+            assert!(
+                !strikes.contains_key(&victim),
+                "deterministic failure must not touch the timeout strike map"
+            );
+            // And it always revokes holder credit / clears the claim.
+            assert!(audit_failure_revokes_holder_credit(&reason));
+            assert!(audit_failure_clears_bootstrap_claim(&reason));
+        }
+
+        // The SAME victim's first timeout, under the same inflated grace, is
+        // only TimeoutGrace (no penalty, no revocation, claim retained).
+        let timeout_action = plan_failed_audit(&AuditFailureReason::Timeout, &mut strikes, &victim);
+        assert_eq!(timeout_action, AuditFailureAction::TimeoutGrace);
+        assert_eq!(strikes.get(&victim).copied(), Some(1));
+        assert!(!audit_failure_revokes_holder_credit(
+            &AuditFailureReason::Timeout
+        ));
+        assert!(!audit_failure_clears_bootstrap_claim(
+            &AuditFailureReason::Timeout
+        ));
     }
 
     /// The exact decision the `Failed` arm of `handle_audit_result`

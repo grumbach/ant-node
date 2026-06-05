@@ -96,35 +96,6 @@ pub struct StorageCommitment {
     pub signature: Vec<u8>,
 }
 
-/// Per-key result in a commitment-bound audit response.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CommitmentBoundResult {
-    /// The challenged key.
-    pub key: XorName,
-    /// `BLAKE3(nonce || challenged_peer_id || key || record_bytes)`. Same
-    /// digest the existing [`compute_audit_digest`] produces; the auditor
-    /// recomputes and compares.
-    ///
-    /// [`compute_audit_digest`]: crate::replication::protocol::compute_audit_digest
-    pub digest: [u8; 32],
-    /// `BLAKE3(record_bytes)`. The auditor uses this to rebuild the Merkle
-    /// leaf and checks it matches its own local bytes hash.
-    pub bytes_hash: [u8; 32],
-    /// Position of the leaf for `key` in the responder's sorted leaf set.
-    ///
-    /// The auditor uses this to know, at each level of the path, whether
-    /// the current hash is the left or right child (even index = left,
-    /// odd = right). Without it the auditor cannot reconstruct the root
-    /// because the same set of sibling hashes admits two different
-    /// orderings.
-    ///
-    /// `leaf_index < commitment.key_count` is enforced in the verifier.
-    pub leaf_index: u32,
-    /// Inclusion path from `leaf = BLAKE3(DOMAIN_LEAF || key || bytes_hash)`
-    /// up to the root. One sibling hash per tree level.
-    pub path: Vec<[u8; 32]>,
-}
-
 // ---------------------------------------------------------------------------
 // Hashing helpers
 // ---------------------------------------------------------------------------
@@ -345,6 +316,36 @@ impl MerkleTree {
     #[must_use]
     pub fn sorted_keys(&self) -> Vec<XorName> {
         self.leaves.iter().map(|(k, _)| *k).collect()
+    }
+
+    /// The key at sorted leaf index `idx`, if in range.
+    ///
+    /// Used by the subtree-proof builder to enumerate the keys of a
+    /// contiguous leaf range without cloning the whole key list.
+    #[must_use]
+    pub fn key_at(&self, idx: usize) -> Option<XorName> {
+        self.leaves.get(idx).map(|(k, _)| *k)
+    }
+
+    /// The node hash at `(level, index)`, where `level` counts up from the
+    /// leaves (`level == 0` is the leaf level, the last level is the root).
+    ///
+    /// Returns `None` if out of range. Used by the subtree-proof builder to
+    /// read sibling cut-hashes along the path from the root to the selected
+    /// subtree; honours the same left-packed self-pair construction as the
+    /// rest of the tree (a caller asking for an out-of-range sibling on an
+    /// odd-length level should substitute the node itself).
+    #[must_use]
+    pub fn node_at(&self, level: usize, index: u64) -> Option<[u8; 32]> {
+        let index = usize::try_from(index).ok()?;
+        self.levels.get(level).and_then(|l| l.get(index)).copied()
+    }
+
+    /// The number of levels in the tree (`1` for a single-leaf tree; the
+    /// last index is the root level). `depth == levels_count() - 1`.
+    #[must_use]
+    pub fn levels_count(&self) -> usize {
+        self.levels.len()
     }
 }
 

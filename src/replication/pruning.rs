@@ -710,6 +710,50 @@ fn prune_audit_response_clears_bootstrap_claim(status: PruneAuditStatus) -> bool
     matches!(status, PruneAuditStatus::Proven | PruneAuditStatus::Failed)
 }
 
+/// Responder side of a single-key prune-confirmation audit.
+///
+/// Answers with one per-key possession digest, an absent-sentinel for keys we
+/// don't hold, or a bootstrapping signal. Pure single-key liveness check — no
+/// commitment state involved.
+pub async fn handle_prune_audit_challenge(
+    challenge: &AuditChallenge,
+    storage: &LmdbStorage,
+    is_bootstrapping: bool,
+) -> AuditResponse {
+    if is_bootstrapping {
+        return AuditResponse::Bootstrapping {
+            challenge_id: challenge.challenge_id,
+        };
+    }
+
+    let mut digests = Vec::with_capacity(challenge.keys.len());
+    for key in &challenge.keys {
+        match storage.get_raw(key).await {
+            Ok(Some(data)) => {
+                digests.push(compute_audit_digest(
+                    &challenge.nonce,
+                    &challenge.challenged_peer_id,
+                    key,
+                    &data,
+                ));
+            }
+            Ok(None) => digests.push(ABSENT_KEY_DIGEST),
+            Err(e) => {
+                warn!(
+                    "Prune audit responder: failed to read key {}: {e}",
+                    hex::encode(key)
+                );
+                digests.push(ABSENT_KEY_DIGEST);
+            }
+        }
+    }
+
+    AuditResponse::Digests {
+        challenge_id: challenge.challenge_id,
+        digests,
+    }
+}
+
 fn encode_prune_audit_challenge(
     peer: &PeerId,
     key: XorName,
@@ -721,11 +765,6 @@ fn encode_prune_audit_challenge(
         nonce,
         challenged_peer_id: *peer.as_bytes(),
         keys: vec![key],
-        // Prune-audit challenges keep legacy plain-digest semantics
-        // (caller does its own per-key digest comparison). Commitment-
-        // bound prune audits are out of scope for phase 2; revisit in
-        // phase 3 if we choose to extend coverage there.
-        expected_commitment_hash: None,
     };
     let msg = ReplicationMessage {
         request_id: challenge_id,

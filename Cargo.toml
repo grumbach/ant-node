@@ -22,6 +22,23 @@ path = "src/bin/ant-node/main.rs"
 name = "ant-devnet"
 path = "src/bin/ant-devnet/main.rs"
 
+# Adversary node used only in large-testnet verification runs. Never
+# built for release — requires `--features adversary` and is excluded
+# from the default binary set via `required-features`.
+[[bin]]
+name = "ant-node-adversary"
+path = "src/bin/ant-node-adversary/main.rs"
+required-features = ["adversary"]
+
+# Local-EVM host for large-testnet verification: stands up one Anvil
+# chain + deploys the ANT token / payment vault so nodes verify payments
+# against a local chain instead of Arbitrum. Excluded from release builds
+# via `required-features`.
+[[bin]]
+name = "ant-evm-testnet"
+path = "src/bin/ant-evm-testnet/main.rs"
+required-features = ["evm-host"]
+
 [dependencies]
 # Global allocator. musl's default malloc is significantly slower than
 # glibc's under concurrent allocation churn, which matches the node's
@@ -160,6 +177,21 @@ logging = ["tracing", "tracing-subscriber", "tracing-appender"]
 # Expose test helpers (cache_insert, payment_verifier accessor) for
 # integration tests and downstream test harnesses.
 test-utils = []
+# Emit structured JSON v12 event log to disk for after-the-fact
+# attribution in large-testnet runs. Off by default; production release
+# builds are byte-identical to the no-feature build (every event helper
+# expands to an empty inline no-op).
+v12-event-log = []
+# Compile the adversary node binary + the in-tree adversary behaviour
+# hooks (`crate::adversary`). NEVER enabled in production builds; the
+# entire module is gated behind `cfg(feature = "adversary")`. Used
+# exclusively in the large-testnet verification harness.
+adversary = ["test-utils"]
+# Compile the `ant-evm-testnet` local-EVM host binary (Anvil + contract
+# deploy). Testnet-only; never in production builds. clap/color-eyre are
+# already non-optional deps, so this is just a gate marker for the bin's
+# `required-features`.
+evm-host = []
 
 [profile.release]
 lto = true

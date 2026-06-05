@@ -109,11 +109,21 @@ pub enum ReplicationMessageBody {
     /// Response with the record data.
     FetchResponse(FetchResponse),
 
-    // === Audit (Section 15) ===
-    /// Storage audit challenge.
+    // === Single-key audit (prune-confirmation) ===
+    /// Single-key audit challenge (used by prune confirmation).
     AuditChallenge(AuditChallenge),
-    /// Response to audit challenge.
+    /// Response to a single-key audit challenge.
     AuditResponse(AuditResponse),
+
+    // === Storage-bound subtree audit (ADR-0002) ===
+    /// Gossip-triggered contiguous-subtree storage audit challenge (round 1).
+    SubtreeAuditChallenge(SubtreeAuditChallenge),
+    /// Response to a contiguous-subtree storage audit challenge (round 1).
+    SubtreeAuditResponse(SubtreeAuditResponse),
+    /// Surprise byte challenge for the spot-checked leaves (round 2).
+    SubtreeByteChallenge(SubtreeByteChallenge),
+    /// Response carrying the requested chunks' original bytes (round 2).
+    SubtreeByteResponse(SubtreeByteResponse),
 }
 
 // ---------------------------------------------------------------------------
@@ -283,11 +293,12 @@ pub enum FetchResponse {
 // Audit Messages
 // ---------------------------------------------------------------------------
 
-/// Storage audit challenge (Section 15).
+/// Single-key audit challenge.
 ///
 /// The challenger picks a random nonce and a set of keys the challenged peer
-/// should hold, then sends this challenge. The challenged peer must prove
-/// storage by returning per-key BLAKE3 digests.
+/// should hold, then sends this challenge. The challenged peer proves storage
+/// by returning per-key BLAKE3 digests. Used by the prune-confirmation path
+/// (a node checks a peer still holds a key before pruning its own copy).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditChallenge {
     /// Unique challenge identifier.
@@ -298,23 +309,9 @@ pub struct AuditChallenge {
     pub challenged_peer_id: [u8; 32],
     /// Ordered list of keys to prove storage of.
     pub keys: Vec<XorName>,
-    /// Auditor's pin to the commitment it expects the responder to use.
-    ///
-    /// `Some(h)`: a commitment-bound audit (v12 design). The responder
-    /// must reply with `AuditResponse::CommitmentBound` whose
-    /// commitment hashes via
-    /// [`crate::replication::commitment::commitment_hash`] to exactly
-    /// `h`. Any other commitment, or a plain `Digests` reply, is an
-    /// audit failure.
-    ///
-    /// `None`: legacy plain-digest audit (today's behaviour). Allows
-    /// challenging peers from whom we haven't yet received a commitment
-    /// without breaking the existing audit flow during rollout.
-    #[serde(default)]
-    pub expected_commitment_hash: Option<[u8; 32]>,
 }
 
-/// Response to audit challenge.
+/// Response to a single-key audit challenge.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AuditResponse {
     /// Per-key digests proving storage.
@@ -342,24 +339,157 @@ pub enum AuditResponse {
         /// Human-readable rejection reason.
         reason: String,
     },
-    /// Commitment-bound proof of storage (v12 storage-bound audit).
+}
+
+/// Gossip-triggered contiguous-subtree storage audit challenge (ADR-0002).
+///
+/// The auditor pins the commitment a peer just gossiped and sends a fresh
+/// random nonce. The nonce alone deterministically selects one contiguous
+/// subtree of the peer's committed Merkle tree (see
+/// [`crate::replication::subtree::select_subtree_path`]); the auditor does
+/// **not** name keys. The responder must reply with a
+/// [`SubtreeAuditResponse::Proof`] for that selected subtree against the pinned
+/// commitment, or a [`SubtreeAuditResponse::Rejected`] if it genuinely cannot
+/// (for a recently gossiped pinned commitment a rejection is a confirmed
+/// failure, since the responder retains its last two gossiped commitments).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubtreeAuditChallenge {
+    /// Unique challenge identifier.
+    pub challenge_id: u64,
+    /// Random nonce. Selects the subtree AND freshens each leaf's possession
+    /// hash, so a stored answer cannot be replayed.
+    pub nonce: [u8; 32],
+    /// Challenged peer ID. Bound into each leaf's possession hash.
+    pub challenged_peer_id: [u8; 32],
+    /// The auditor's pin: the [`crate::replication::commitment::commitment_hash`]
+    /// of the commitment the peer just gossiped. The response's commitment must
+    /// hash to exactly this value.
+    pub expected_commitment_hash: [u8; 32],
+}
+
+/// Response to a contiguous-subtree storage audit challenge (ADR-0002).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SubtreeAuditResponse {
+    /// The single-contiguous-subtree proof.
     ///
-    /// Returned when the challenge carried an
-    /// [`AuditChallenge::expected_commitment_hash`]. Carries the
-    /// responder's signed commitment plus per-key Merkle inclusion
-    /// proofs. The auditor verifies that:
-    ///   1. `commitment_hash(commitment) == challenge.expected_commitment_hash`
-    ///   2. The commitment's signature is valid.
-    ///   3. For each per-key entry: the Merkle path verifies the leaf
-    ///      against the commitment root AND the digest matches the
-    ///      auditor's local copy of the bytes.
-    CommitmentBound {
+    /// Carries the responder's signed commitment (so the auditor re-derives
+    /// `key_count` and confirms the pin and signature) and the
+    /// nonce-selected subtree expanded to its leaves plus the sibling
+    /// cut-hashes on the path to the root. This is **round 1** of the
+    /// two-round audit. The auditor:
+    ///   1. confirms `commitment_hash(commitment) == expected_commitment_hash`
+    ///      and the signature is valid;
+    ///   2. re-derives the selected subtree from `(nonce, key_count)`, rebuilds
+    ///      the root from the proof, and requires it to equal the commitment
+    ///      root (structure).
+    ///
+    /// The leaves carry only hashes (`bytes_hash`, `nonced_hash`), so this round
+    /// proves the tree SHAPE is committed — not that the bytes are still held.
+    /// Real possession is proven in **round 2**: the auditor picks a few of the
+    /// just-verified leaves and sends a [`SubtreeByteChallenge`] requesting their
+    /// original chunk bytes FROM the responder (see that type).
+    Proof {
         /// The challenge this response answers.
         challenge_id: u64,
-        /// The signed commitment whose root the proofs are against.
+        /// The signed commitment whose root the proof is against.
         commitment: crate::replication::commitment::StorageCommitment,
-        /// Per-key Merkle inclusion proofs, in challenge order.
-        per_key: Vec<crate::replication::commitment::CommitmentBoundResult>,
+        /// The nonce-selected contiguous subtree proof.
+        proof: crate::replication::subtree::SubtreeProof,
+    },
+    /// Peer is still bootstrapping (not ready for audit).
+    Bootstrapping {
+        /// The challenge this response answers.
+        challenge_id: u64,
+    },
+    /// Challenge rejected. The `reason` is for logging only; for a recently
+    /// gossiped pinned commitment a rejection is a confirmed failure (the
+    /// responder retains its last two gossiped commitments and must be able to
+    /// answer either).
+    Rejected {
+        /// The challenge this response answers.
+        challenge_id: u64,
+        /// Human-readable rejection reason.
+        reason: String,
+    },
+}
+
+/// Round 2 of the storage audit (ADR-0002): the **surprise byte challenge**.
+///
+/// After the auditor has structurally verified a [`SubtreeAuditResponse::Proof`]
+/// it picks a small, nonce-derived random sample of that subtree's just-proven
+/// leaves (the responder cannot predict which) and asks the responder to return
+/// the ORIGINAL chunk bytes for exactly those keys. The auditor then checks each
+/// returned chunk against the committed leaf:
+///   - `BLAKE3(bytes) == leaf.bytes_hash` (the chunk's content address), AND
+///   - `compute_audit_digest(nonce, peer, key, bytes) == leaf.nonced_hash`.
+///
+/// This makes possession non-delegable to the auditor: the auditor needs to
+/// hold NONE of the responder's chunks. A responder that committed to a chunk it
+/// no longer holds cannot fabricate bytes that hash to the committed address (a
+/// preimage break), so it is caught regardless of who audits it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubtreeByteChallenge {
+    /// The same `challenge_id` as the round-1 [`SubtreeAuditChallenge`], so the
+    /// responder/auditor correlate the two rounds.
+    pub challenge_id: u64,
+    /// The same nonce as round 1 — needed for the freshness (`nonced_hash`)
+    /// check and to bind these bytes to this audit.
+    pub nonce: [u8; 32],
+    /// The challenged peer ID (bound into each leaf's possession hash).
+    pub challenged_peer_id: [u8; 32],
+    /// The pinned commitment hash from round 1, so the responder resolves the
+    /// SAME tree it just proved and serves bytes only for keys it committed to.
+    pub expected_commitment_hash: [u8; 32],
+    /// The exact keys whose original bytes the responder must return. These are
+    /// the auditor's nonce-derived spot-check sample of the round-1 subtree.
+    pub keys: Vec<XorName>,
+}
+
+/// One requested chunk in a [`SubtreeByteResponse`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SubtreeByteItem {
+    /// The responder holds this committed key and returns its original bytes.
+    Present {
+        /// The requested key.
+        key: XorName,
+        /// The original chunk bytes (the auditor re-hashes to verify).
+        bytes: Vec<u8>,
+    },
+    /// The responder committed to this key but cannot serve its bytes. This is a
+    /// PROVABLE cheat (it published a commitment over a chunk it does not hold),
+    /// so the auditor counts it as a confirmed failure — NOT a graced timeout.
+    /// Distinguishing this explicit signal from silence is what separates a
+    /// deleter (instant fail) from a dropped packet (timeout).
+    Absent {
+        /// The committed key the responder could not serve.
+        key: XorName,
+    },
+}
+
+/// Response to a [`SubtreeByteChallenge`] (round 2). One item per requested key,
+/// in the requested order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SubtreeByteResponse {
+    /// The responder's per-key answers (bytes or an explicit absent signal).
+    Items {
+        /// The challenge this response answers.
+        challenge_id: u64,
+        /// One entry per requested key.
+        items: Vec<SubtreeByteItem>,
+    },
+    /// Peer is still bootstrapping (should not happen mid-audit, but handled).
+    Bootstrapping {
+        /// The challenge this response answers.
+        challenge_id: u64,
+    },
+    /// The responder rejects the byte challenge outright (e.g. it no longer
+    /// retains the pinned commitment). For a recently gossiped commitment the
+    /// auditor treats this as a confirmed failure, like round 1.
+    Rejected {
+        /// The challenge this response answers.
+        challenge_id: u64,
+        /// Human-readable rejection reason.
+        reason: String,
     },
 }
 
@@ -607,37 +737,6 @@ mod tests {
         assert_eq!(old_decoded.rejected_keys.len(), 1);
     }
 
-    /// `AuditChallenge` extension: old peer (no `expected_commitment_hash`
-    /// field) decodes a new-peer message OK.
-    #[test]
-    fn old_decoder_tolerates_new_audit_challenge() {
-        use serde::Deserialize;
-        #[derive(Deserialize)]
-        struct OldAuditChallenge {
-            #[allow(dead_code)]
-            pub challenge_id: u64,
-            #[allow(dead_code)]
-            pub nonce: [u8; 32],
-            #[allow(dead_code)]
-            pub challenged_peer_id: [u8; 32],
-            #[allow(dead_code)]
-            pub keys: Vec<XorName>,
-        }
-
-        let new_ch = AuditChallenge {
-            challenge_id: 7,
-            nonce: [0xAA; 32],
-            challenged_peer_id: [0xBB; 32],
-            keys: vec![[0x01; 32], [0x02; 32]],
-            expected_commitment_hash: None,
-        };
-        let encoded = postcard::to_stdvec(&new_ch).expect("encode");
-        let old_decoded: OldAuditChallenge =
-            postcard::from_bytes(&encoded).expect("old decoder accepts");
-        assert_eq!(old_decoded.challenge_id, 7);
-        assert_eq!(old_decoded.keys.len(), 2);
-    }
-
     /// Roundtrip: a new peer can decode its own message including the
     /// commitment field. Catches accidental serde annotation breakage
     /// (e.g. forgetting `#[serde(default)]` on the new field).
@@ -879,7 +978,6 @@ mod tests {
                 nonce: [0xAB; 32],
                 challenged_peer_id: [0xCD; 32],
                 keys: vec![[0x01; 32], [0x02; 32]],
-                expected_commitment_hash: None,
             }),
         };
         let encoded = msg.encode().expect("encode should succeed");

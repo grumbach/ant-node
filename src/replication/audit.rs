@@ -1,29 +1,33 @@
-//! Storage audit protocol (Section 15).
+//! Gossip-triggered contiguous-subtree storage audit (ADR-0002).
 //!
-//! Challenge-response for claimed holders. Anti-outsourcing protection.
+//! A node commits to what it stores (a signed Merkle [`StorageCommitment`]
+//! gossiped to neighbours). On receiving a peer's changed commitment, a
+//! neighbour may audit it: pin the just-gossiped root, send a fresh nonce that
+//! deterministically selects one contiguous subtree, and require the peer to
+//! prove that subtree (structure + real bytes) within a deadline. This module
+//! owns the auditor entry point [`run_subtree_audit`] and the responder handler
+//! [`handle_subtree_challenge`]; the pure proof maths live in
+//! [`crate::replication::subtree`].
 
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::logging::{debug, info, warn};
-use rand::seq::SliceRandom;
 use rand::Rng;
 
 use crate::ant_protocol::XorName;
-use crate::replication::commitment::{commitment_hash, CommitmentBoundResult, StorageCommitment};
-use crate::replication::commitment_audit::{
-    verify_commitment_bound_metadata, verify_commitment_bound_per_key,
-};
-use crate::replication::commitment_state::PeerCommitmentRecord;
+use crate::replication::commitment::{commitment_hash, StorageCommitment};
+use crate::replication::commitment_state::ResponderCommitmentState;
 use crate::replication::config::{ReplicationConfig, REPLICATION_PROTOCOL_ID};
 use crate::replication::protocol::{
-    compute_audit_digest, AuditChallenge, AuditResponse, ReplicationMessage,
-    ReplicationMessageBody, ABSENT_KEY_DIGEST,
+    ReplicationMessage, ReplicationMessageBody, SubtreeAuditChallenge, SubtreeAuditResponse,
+    SubtreeByteChallenge, SubtreeByteItem, SubtreeByteResponse,
 };
 use crate::replication::recent_provers::RecentProvers;
-use crate::replication::types::{
-    AuditFailureReason, FailureEvidence, PeerSyncRecord, RepairProofs,
+use crate::replication::subtree::{
+    select_spotcheck_indices, select_subtree_path, subtree_plan, verify_subtree_proof,
+    StructureVerdict, SubtreeProof,
 };
+use crate::replication::types::{AuditFailureReason, FailureEvidence};
 use crate::storage::LmdbStorage;
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
@@ -33,2183 +37,1265 @@ use tokio::sync::RwLock;
 // Audit tick result
 // ---------------------------------------------------------------------------
 
-/// Result of an audit tick.
+/// Outcome of a single gossip-triggered audit.
 #[derive(Debug)]
 pub enum AuditTickResult {
-    /// Audit completed successfully (all digests matched).
+    /// The subtree proof verified (structure + real-bytes spot-checks).
     Passed {
         /// The peer that was challenged.
         challenged_peer: PeerId,
-        /// Number of keys verified.
+        /// Number of subtree leaves whose bytes were spot-checked.
         keys_checked: usize,
     },
-    /// Audit found failures (after responsibility confirmation).
+    /// A confirmed audit failure (forged/inconsistent proof, byte/nonce
+    /// mismatch, repudiation of a recently gossiped commitment, or timeout).
     Failed {
-        /// Evidence of the failure for trust engine.
+        /// Evidence of the failure for the trust engine.
         evidence: FailureEvidence,
     },
-    /// Audit target claimed bootstrapping.
+    /// Audit target claimed it is still bootstrapping.
     BootstrapClaim {
         /// The peer claiming bootstrap status.
         peer: PeerId,
     },
-    /// No eligible peers for audit this tick.
+    /// Nothing to do this round (e.g. auditor itself is bootstrapping, or the
+    /// pinned commitment is out of protocol range). No trust effect.
     Idle,
-    /// Audit skipped (not enough local keys).
+    /// Retained for the engine's exhaustive match; not produced by the
+    /// gossip-triggered auditor (which never samples local keys).
     InsufficientKeys,
 }
 
 // ---------------------------------------------------------------------------
-// Main audit tick
+// Auditor side
 // ---------------------------------------------------------------------------
 
-/// Read-only context the auditor uses to issue commitment-bound audits.
+/// ADR-0002 round-2 byte challenge samples a SMALL surprise set of the proven
+/// leaves (3..=5). Small enough that the responder's honest local-disk read of
+/// the original chunks stays well inside the possession-in-time deadline, while
+/// a relay forced to fetch them over the network blows it; large enough that
+/// faking a fraction `x` of leaves survives only `(1 - x)^k`.
+const BYTE_SPOTCHECK_MIN: u32 = 3;
+const BYTE_SPOTCHECK_MAX: u32 = 5;
+
+/// Holder-eligibility cache the auditor credits on a passing audit.
 ///
-/// Bundled into one struct so [`audit_tick_with_repair_proofs`] stays
-/// readable when v12 enforcement is enabled. Passing `None` falls back
-/// to today's plain-digest audit; passing `Some` opts in on a per-peer
-/// basis (a peer with no entry in `last_commitment_by_peer` still gets
-/// the legacy path).
-///
-/// `last_commitment_by_peer` and `recent_provers` are owned by
-/// [`crate::replication::ReplicationEngine`]; this struct borrows them.
-pub struct CommitmentAuditCtx<'a> {
-    /// Per-peer record: last-known commitment + sticky `commitment_capable`
-    /// flag (populated from gossip ingest). The auditor pins
-    /// `commitment_hash(record.last_commitment)` into the challenge for
-    /// any peer whose record carries a commitment.
-    pub last_commitment_by_peer: &'a Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
-    /// Sticky "ever v12-capable" set, independent of
-    /// `last_commitment_by_peer` (whose entries can be evicted by
-    /// `PeerRemoved` and the sybil cap). The §3 audit shield consults
-    /// this so a previously-v12 peer whose LRU record was evicted
-    /// still gets the no-legacy-fallback treatment until they
-    /// re-gossip a fresh commitment.
-    pub ever_capable_peers: &'a Arc<RwLock<HashSet<PeerId>>>,
-    /// Holder-eligibility cache. On a successful commitment-bound audit
-    /// the auditor records `(challenged_peer, key, commitment_hash)` so
-    /// downstream code (quorum, paid lists) can credit the peer as a
-    /// real holder.
+/// Owned by [`crate::replication::ReplicationEngine`]; borrowed here so a
+/// passing audit can record `(peer, commitment_hash)` as a proven holder for
+/// downstream quorum / paid-list credit.
+pub struct AuditCredit<'a> {
+    /// Holder-eligibility cache.
     pub recent_provers: &'a Arc<RwLock<RecentProvers>>,
 }
 
-/// Execute one audit tick (Section 15 steps 2-9).
-///
-/// Returns the audit result. Caller is responsible for emitting trust events.
-///
-/// **Invariant 19**: Returns [`AuditTickResult::Idle`] immediately if
-/// `is_bootstrapping` is `true` — a node must not audit others while it
-/// is still bootstrapping.
-#[allow(clippy::implicit_hasher)]
-pub async fn audit_tick(
-    p2p_node: &Arc<P2PNode>,
-    storage: &Arc<LmdbStorage>,
-    config: &ReplicationConfig,
-    sync_history: &HashMap<PeerId, PeerSyncRecord>,
-    is_bootstrapping: bool,
-) -> AuditTickResult {
-    let repair_proofs = Arc::new(RwLock::new(RepairProofs::new()));
-    audit_tick_with_repair_proofs(
-        p2p_node,
-        storage,
-        config,
-        sync_history,
-        &repair_proofs,
-        0,
-        is_bootstrapping,
-        None,
-    )
-    .await
+/// The cross-cutting context for verifying one audit response, bundled so the
+/// response-dispatch and verification functions stay readable.
+struct AuditCtx<'a> {
+    p2p_node: &'a Arc<P2PNode>,
+    challenged_peer: &'a PeerId,
+    challenge_id: u64,
+    nonce: [u8; 32],
+    expected_commitment_hash: [u8; 32],
+    config: &'a ReplicationConfig,
+    credit: Option<&'a AuditCredit<'a>>,
 }
 
-/// Execute one repair-proof-gated audit tick.
+/// Run one gossip-triggered subtree audit against `challenged_peer`, pinned to
+/// the commitment hash the peer just gossiped (`expected_commitment_hash`).
 ///
-/// This is the production path used by the replication engine. The
-/// compatibility [`audit_tick`] wrapper passes an empty proof table, so direct
-/// callers that have not adopted repair proofs remain conservative and do not
-/// audit peers for unproven keys.
-#[allow(
-    clippy::implicit_hasher,
-    clippy::too_many_lines,
-    clippy::too_many_arguments
-)]
-pub async fn audit_tick_with_repair_proofs(
+/// ADR-0002 two-round audit. The auditor sends a fresh random nonce and runs:
+///
+/// 1. **Structure** (round 1) — the returned subtree rebuilds to the pinned
+///    root, within a size-scaled deadline.
+/// 2. **Real bytes** (round 2) — the auditor demands the ORIGINAL chunk content
+///    for a 3..=5 nonce-selected sample of the proven leaves FROM the responder,
+///    and recomputes both the content-address hash and the nonce freshness hash
+///    from that served content. The auditor holds none of the peer's chunks.
+/// 3. **Timing** — each round's deadline is sized to an honest local-disk read,
+///    so a relay forced to fetch over the network blows it.
+///
+/// A timeout (either round) is reported as [`AuditFailureReason::Timeout`] (the
+/// caller applies the strike/grace policy). Any structural failure, served
+/// content that fails a hash, an explicit `Absent` for a committed sampled key,
+/// or a rejection of a recently gossiped commitment, is a confirmed failure
+/// acted on immediately. On a full pass, records the peer as a proven holder.
+pub async fn run_subtree_audit(
     p2p_node: &Arc<P2PNode>,
-    storage: &Arc<LmdbStorage>,
     config: &ReplicationConfig,
-    sync_history: &HashMap<PeerId, PeerSyncRecord>,
-    repair_proofs: &Arc<RwLock<RepairProofs>>,
-    current_sync_epoch: u64,
-    is_bootstrapping: bool,
-    commitment_ctx: Option<&CommitmentAuditCtx<'_>>,
+    challenged_peer: &PeerId,
+    expected_commitment_hash: [u8; 32],
+    key_count: u32,
+    credit: Option<&AuditCredit<'_>>,
 ) -> AuditTickResult {
-    // Invariant 19: never audit while still bootstrapping.
-    if is_bootstrapping {
-        return AuditTickResult::Idle;
-    }
-
-    let dht = p2p_node.dht_manager();
-
-    // Step 2: Select one eligible peer (has RepairOpportunity) at random.
-    // Peers with active bootstrap claims remain eligible. A follow-up audit is
-    // how we observe a continued claim and apply past-grace abuse handling.
-    let eligible_peers = eligible_audit_peers(sync_history);
-
-    if eligible_peers.is_empty() {
-        return AuditTickResult::Idle;
-    }
-
-    let (challenged_peer, nonce, challenge_id) = {
+    let (nonce, challenge_id) = {
         let mut rng = rand::thread_rng();
-        let selected = match eligible_peers.choose(&mut rng) {
-            Some(p) => *p,
-            None => return AuditTickResult::Idle,
-        };
-        let n: [u8; 32] = rng.gen();
-        let c: u64 = rng.gen();
-        (selected, n, c)
+        (rng.gen::<[u8; 32]>(), rng.gen::<u64>())
     };
 
-    // Step 3: Sample keys from local store and keep those the peer is
-    // responsible for (appears in the close group via local RT lookup).
-    let all_keys = match storage.all_keys().await {
-        Ok(keys) => keys,
-        Err(e) => {
-            warn!("Audit: failed to read local keys: {e}");
-            return AuditTickResult::Idle;
-        }
-    };
-
-    if all_keys.is_empty() {
-        return AuditTickResult::Idle;
-    }
-
-    let sample_count = ReplicationConfig::audit_sample_count(all_keys.len());
-    let sampled_keys: Vec<XorName> = {
-        let mut rng = rand::thread_rng();
-        all_keys
-            .choose_multiple(&mut rng, sample_count)
-            .copied()
-            .collect()
-    };
-
-    // Step 4: Filter to keys where the chosen peer is in the close group and
-    // this node has proof that it already sent the peer a repair hint for the
-    // specific key.
-    let mut sampled_key_groups = Vec::new();
-    for key in &sampled_keys {
-        let closest = dht
-            .find_closest_nodes_local_with_self(key, config.close_group_size)
-            .await;
-        let close_peers: HashSet<PeerId> = closest.iter().map(|node| node.peer_id).collect();
-        if close_peers.contains(&challenged_peer) {
-            sampled_key_groups.push((*key, close_peers));
-        }
-    }
-
-    let peer_keys = {
-        let mut proofs = repair_proofs.write().await;
-        mature_audit_keys_for_peer(
-            &challenged_peer,
-            sampled_key_groups,
-            &mut proofs,
-            current_sync_epoch,
-        )
-    };
-
-    if peer_keys.is_empty() {
-        return AuditTickResult::Idle;
-    }
-
-    // peer_keys is naturally bounded by audit_sample_count (sqrt-scaled),
-    // so no explicit truncation needed.
-
-    // Step 6: Send challenge.
-    //
-    // Phase 3: if we have a commitment audit context AND we have a last
-    // known commitment from this peer (received via gossip), pin its
-    // hash into the challenge so the responder must answer against the
-    // exact commitment whose hash we pinned. Defeats fresh-commitment
-    // substitution by lazy nodes (v12 §5 gate 2b).
-    //
-    // We snapshot the pinned commitment alongside the hash so the
-    // response-handling code can verify against the SAME commitment we
-    // pinned (avoids a race where the peer's last_commitment_by_peer
-    // entry rotates between issue and response handling).
-    // Snapshot the peer record once; we use it both for pinning the
-    // challenge and (below) for the §3 commitment_capable downgrade
-    // check. Record carries last_commitment + sticky `commitment_capable`.
-    let peer_record = match commitment_ctx {
-        Some(ctx) => ctx
-            .last_commitment_by_peer
-            .read()
-            .await
-            .get(&challenged_peer)
-            .cloned(),
-        None => None,
-    };
-    // Only the pin (hash) is needed to issue the challenge; the
-    // responder answers against its own retained commitment, so we
-    // never need to clone the full StorageCommitment here.
-    let expected_commitment_hash = peer_record
-        .as_ref()
-        .and_then(|r| r.last_commitment.as_ref())
-        .and_then(commitment_hash);
-
-    // §3 + §6 bootstrap-claim shield: if this peer has EVER gossiped a
-    // commitment we MUST NOT fall back to legacy plain-digest audits
-    // when we currently lack their cached commitment. The peer is
-    // expected to speak v12; falling back would let them downgrade to
-    // the weaker path. Return Idle until they re-gossip a fresh
-    // commitment.
-    //
-    // We consult two sources for the sticky-capable signal: the per-
-    // record `commitment_capable` bit (still set on the active LRU
-    // entry) AND the `ever_capable_peers` set (preserved across
-    // PeerRemoved cleanup and sybil-cap eviction of the LRU). Either
-    // one being true engages the shield.
-    let is_capable = peer_record.as_ref().is_some_and(|r| r.commitment_capable)
-        || match commitment_ctx {
-            Some(ctx) => ctx
-                .ever_capable_peers
-                .read()
-                .await
-                .contains(&challenged_peer),
-            None => false,
-        };
-    let has_current_commitment = peer_record
-        .as_ref()
-        .is_some_and(|r| r.last_commitment.is_some());
-    if is_capable && !has_current_commitment {
-        // BY DESIGN this is a no-penalty path: a capable-but-silent peer is
-        // never strike-penalised here (Idle records no strike). It gains
-        // nothing by going silent — its §6 holder credit independently
-        // expires (PROVER_ENTRY_TTL), so it stops being counted as a holder
-        // for quorum/paid-list. We skip rather than penalise because the
-        // missing commitment is indistinguishable from honest TTL/restart
-        // churn; the next fresh gossip re-enables auditing.
-        info!(
-            "Audit: peer {challenged_peer} is commitment-capable but we have no \
-             cached commitment (TTL/restart/silence); skipping audit until fresh gossip"
-        );
-        return AuditTickResult::Idle;
-    }
-
-    let challenge = AuditChallenge {
+    let challenge = SubtreeAuditChallenge {
         challenge_id,
         nonce,
         challenged_peer_id: *challenged_peer.as_bytes(),
-        keys: peer_keys.clone(),
         expected_commitment_hash,
     };
-
     let msg = ReplicationMessage {
         request_id: challenge_id,
-        body: ReplicationMessageBody::AuditChallenge(challenge),
+        body: ReplicationMessageBody::SubtreeAuditChallenge(challenge),
     };
-
     let encoded = match msg.encode() {
         Ok(data) => data,
         Err(e) => {
-            warn!("Audit: failed to encode challenge: {e}");
+            warn!("Audit: failed to encode subtree challenge for {challenged_peer}: {e}");
             return AuditTickResult::Idle;
         }
     };
 
+    // Size the proof deadline from the ACTUAL selected subtree (its real-leaf
+    // count for this nonce + key_count), not a fixed worst-case hint. This keeps
+    // the deadline tight to "responder hashes ~sqrt(N) chunks at local-disk
+    // speed", so a relay that must fetch the subtree over the network blows it.
+    // The auditor and responder derive the same selection, so we know the leaf
+    // count before the response arrives.
+    let subtree_leaves = select_subtree_path(&nonce, key_count).map_or_else(
+        || config.subtree_audit_timeout_leaf_hint(),
+        |p| p.real_leaf_count() as usize,
+    );
+    let timeout = config.audit_response_timeout(subtree_leaves);
+
+    crate::replication::events::audit_issued(
+        &crate::replication::events::peer_hex(challenged_peer),
+        challenge_id,
+        subtree_leaves,
+        Some(&crate::replication::events::hex32(
+            &expected_commitment_hash,
+        )),
+        true,
+    );
+
     let response = match p2p_node
+        .send_request(challenged_peer, REPLICATION_PROTOCOL_ID, encoded, timeout)
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            debug!("Audit: subtree challenge to {challenged_peer} timed out / failed: {e}");
+            return failed(challenged_peer, challenge_id, AuditFailureReason::Timeout);
+        }
+    };
+
+    let resp_msg = match ReplicationMessage::decode(&response.data) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("Audit: failed to decode subtree response from {challenged_peer}: {e}");
+            return failed(
+                challenged_peer,
+                challenge_id,
+                AuditFailureReason::MalformedResponse,
+            );
+        }
+    };
+
+    let ctx = AuditCtx {
+        p2p_node,
+        challenged_peer,
+        challenge_id,
+        nonce,
+        expected_commitment_hash,
+        config,
+        credit,
+    };
+    dispatch_subtree_response(resp_msg.body, &ctx).await
+}
+
+/// Outcome of the round-2 byte challenge round-trip (auditor side).
+enum ByteRound {
+    /// The responder returned per-key items (verified by the caller).
+    Served(Vec<SubtreeByteItem>),
+    /// The responder rejected the byte challenge (confirmed failure for a
+    /// recently pinned commitment).
+    Rejected,
+    /// No response within the byte deadline, or a transport error (graced
+    /// timeout).
+    Timeout,
+    /// Malformed / unexpected round-2 response body.
+    Malformed,
+}
+
+/// Round 2: ask the responder for the ORIGINAL chunk content of the
+/// auditor-selected spot-check `keys`, sized to a possession-in-time deadline
+/// (honest local-disk read of `keys.len()` chunks). The responder cannot have
+/// predicted which keys are sampled.
+async fn request_byte_proof(ctx: &AuditCtx<'_>, keys: &[XorName]) -> ByteRound {
+    let challenge = SubtreeByteChallenge {
+        challenge_id: ctx.challenge_id,
+        nonce: ctx.nonce,
+        challenged_peer_id: *ctx.challenged_peer.as_bytes(),
+        expected_commitment_hash: ctx.expected_commitment_hash,
+        keys: keys.to_vec(),
+    };
+    let msg = ReplicationMessage {
+        request_id: ctx.challenge_id,
+        body: ReplicationMessageBody::SubtreeByteChallenge(challenge),
+    };
+    let encoded = match msg.encode() {
+        Ok(data) => data,
+        Err(e) => {
+            warn!("Audit: failed to encode byte challenge: {e}");
+            return ByteRound::Malformed;
+        }
+    };
+
+    // Deadline sized to "honest responder reads `keys.len()` local chunks": a
+    // relay forced to fetch them over the network blows it (graced timeout,
+    // never a confirmed failure — same possession-in-time principle as round 1).
+    let timeout = ctx.config.audit_response_timeout(keys.len());
+    let response = match ctx
+        .p2p_node
         .send_request(
-            &challenged_peer,
+            ctx.challenged_peer,
             REPLICATION_PROTOCOL_ID,
             encoded,
-            config.audit_response_timeout(peer_keys.len()),
+            timeout,
         )
         .await
     {
         Ok(resp) => resp,
         Err(e) => {
-            debug!("Audit: challenge to {challenged_peer} failed: {e}");
-            // Timeout — need responsibility confirmation before penalty.
-            return handle_audit_timeout(
-                &challenged_peer,
-                challenge_id,
-                &peer_keys,
-                p2p_node,
-                config,
-            )
-            .await;
+            debug!(
+                "Audit: byte challenge to {} timed out / failed: {e}",
+                ctx.challenged_peer
+            );
+            return ByteRound::Timeout;
         }
     };
 
-    // Step 7: Parse response.
     let resp_msg = match ReplicationMessage::decode(&response.data) {
         Ok(m) => m,
         Err(e) => {
-            warn!("Audit: failed to decode response from {challenged_peer}: {e}");
-            return handle_audit_failure(
-                &challenged_peer,
-                challenge_id,
-                &peer_keys,
-                AuditFailureReason::MalformedResponse,
-                p2p_node,
-                config,
-            )
-            .await;
+            warn!("Audit: failed to decode byte response: {e}");
+            return ByteRound::Malformed;
         }
     };
 
     match resp_msg.body {
-        ReplicationMessageBody::AuditResponse(AuditResponse::Bootstrapping {
-            challenge_id: resp_id,
-        }) => {
-            if resp_id != challenge_id {
-                warn!("Audit: challenge ID mismatch on Bootstrapping from {challenged_peer}");
-                return handle_audit_failure(
-                    &challenged_peer,
-                    challenge_id,
-                    &peer_keys,
-                    AuditFailureReason::MalformedResponse,
-                    p2p_node,
-                    config,
-                )
-                .await;
-            }
-            // Step 7b: Bootstrapping claim.
-            AuditTickResult::BootstrapClaim {
-                peer: challenged_peer,
-            }
+        ReplicationMessageBody::SubtreeByteResponse(SubtreeByteResponse::Items {
+            challenge_id,
+            items,
+        }) if challenge_id == ctx.challenge_id => ByteRound::Served(items),
+        ReplicationMessageBody::SubtreeByteResponse(SubtreeByteResponse::Rejected {
+            challenge_id,
+            reason,
+        }) if challenge_id == ctx.challenge_id => {
+            warn!(
+                "Audit: {} rejected byte challenge: {reason}",
+                ctx.challenged_peer
+            );
+            ByteRound::Rejected
         }
-        ReplicationMessageBody::AuditResponse(AuditResponse::Digests {
+        // A node claiming bootstrap MID-AUDIT (it answered round 1) is treated
+        // as a timeout: it didn't prove possession but the round-1 proof shows
+        // it isn't bootstrapping, so the bootstrap-claim-abuse detector (round 1)
+        // owns that lane; here we just don't credit it.
+        ReplicationMessageBody::SubtreeByteResponse(SubtreeByteResponse::Bootstrapping {
+            challenge_id,
+        }) if challenge_id == ctx.challenge_id => ByteRound::Timeout,
+        _ => ByteRound::Malformed,
+    }
+}
+
+/// Map a decoded response body to an audit outcome (auditor side). A response
+/// whose `challenge_id` doesn't match, or any non-subtree body, is malformed.
+async fn dispatch_subtree_response(
+    body: ReplicationMessageBody,
+    ctx: &AuditCtx<'_>,
+) -> AuditTickResult {
+    let challenged_peer = ctx.challenged_peer;
+    let challenge_id = ctx.challenge_id;
+    let malformed = || {
+        failed(
+            challenged_peer,
+            challenge_id,
+            AuditFailureReason::MalformedResponse,
+        )
+    };
+    match body {
+        ReplicationMessageBody::SubtreeAuditResponse(SubtreeAuditResponse::Bootstrapping {
             challenge_id: resp_id,
-            digests,
         }) => {
             if resp_id != challenge_id {
-                warn!("Audit: challenge ID mismatch from {challenged_peer}");
-                return handle_audit_failure(
-                    &challenged_peer,
-                    challenge_id,
-                    &peer_keys,
-                    AuditFailureReason::MalformedResponse,
-                    p2p_node,
-                    config,
-                )
-                .await;
+                return malformed();
             }
-            // Wire-contract enforcement (codex round-9 MAJOR): when we
-            // pinned a commitment hash into the challenge, the responder
-            // MUST answer with CommitmentBound or Rejected/Bootstrapping.
-            // Falling back to plain Digests would let a peer that has
-            // already gossiped a commitment ignore the storage-bound
-            // path and pass via on-demand fetch under the weaker legacy
-            // verifier. Treat as malformed.
-            if expected_commitment_hash.is_some() {
-                warn!(
-                    "Audit: peer {challenged_peer} answered Digests to a pinned challenge \
-                     (commitment-bound contract violation) — treating as malformed"
-                );
-                return handle_audit_failure(
-                    &challenged_peer,
-                    challenge_id,
-                    &peer_keys,
-                    AuditFailureReason::MalformedResponse,
-                    p2p_node,
-                    config,
-                )
-                .await;
-            }
-            verify_digests(
-                &challenged_peer,
+            crate::replication::events::audit_outcome(
+                &crate::replication::events::peer_hex(challenged_peer),
                 challenge_id,
-                &nonce,
-                &peer_keys,
-                &digests,
-                storage,
-                p2p_node,
-                config,
-            )
-            .await
+                "bootstrap_claim",
+                None,
+            );
+            AuditTickResult::BootstrapClaim {
+                peer: *challenged_peer,
+            }
         }
-        ReplicationMessageBody::AuditResponse(AuditResponse::Rejected {
+        ReplicationMessageBody::SubtreeAuditResponse(SubtreeAuditResponse::Rejected {
             challenge_id: resp_id,
             reason,
         }) => {
             if resp_id != challenge_id {
-                warn!("Audit: challenge ID mismatch on Rejected from {challenged_peer}");
-                return handle_audit_failure(
-                    &challenged_peer,
-                    challenge_id,
-                    &peer_keys,
-                    AuditFailureReason::MalformedResponse,
-                    p2p_node,
-                    config,
-                )
-                .await;
+                return malformed();
             }
-            // v12 paragraph 5 conditional invalidation, refined:
-            //
-            // When we issued a pinned challenge and the peer responds
-            // "unknown commitment hash", DO NOT drop the pin and DO NOT
-            // give a free pass. Two reasons:
-            //
-            //   1. If the peer genuinely rotated past our pin (honest
-            //      case), their two-slot retention (current+previous)
-            //      means they could still answer one rotation back —
-            //      so "unknown" here means we are at least two
-            //      rotations behind their gossip. The next gossip round
-            //      (a few minutes) will bring us a fresh commitment to
-            //      pin, and the cache entry will be replaced naturally
-            //      via the gossip ingest path. We don't need to drop
-            //      anything ourselves.
-            //
-            //   2. If we drop the pin on "unknown", a malicious peer
-            //      can claim "unknown" to shed every pinned audit they
-            //      receive — the next tick has no pin → legacy plain-
-            //      digest path → on-demand fetch attack reopens
-            //      (codex round-8 MAJOR).
-            //
-            // So: when the responder says "unknown" AND we pinned, log
-            // and return Idle without penalty (one tick wasted) but
-            // KEEP the pin. The honest case self-resolves via gossip;
-            // the malicious case keeps re-failing pinned audits until
-            // their trust drops naturally through other mechanisms or
-            // we receive a fresh gossiped commitment. Strict gating on
-            // exact reason + pinned challenge prevents the round-6
-            // bypass (a peer cannot trigger this path on a legacy
-            // unpinned audit because expected_commitment_hash is None).
-            if expected_commitment_hash.is_some() && reason == "unknown commitment hash" {
-                // v12 §5 conditional invalidation:
-                // - Case 1 (lazy rotation): peer dropped bytes, no fresh
-                //   gossip, still pinned to H. Stored hash == H. Clear
-                //   the pin → recent_provers entries lose their match
-                //   basis → credit dropped via is_credited_holder. This
-                //   is now safe because §3 above causes the next audit
-                //   to return Idle (commitment_capable but no
-                //   last_commitment) instead of falling back to legacy.
-                // - Case 2 (honest rotation): peer gossiped C2 between
-                //   our challenge and processing. Stored hash != H.
-                //   Keep the new C2 entry, drop credits anchored to H.
-                // - Case 3 (stale auditor): same as case 1; clear pin,
-                //   wait for next gossip.
-                if let (Some(ctx), Some(pin)) = (commitment_ctx, expected_commitment_hash) {
-                    let mut last = ctx.last_commitment_by_peer.write().await;
-                    if let Some(rec) = last.get_mut(&challenged_peer) {
-                        let stored_h = rec.last_commitment.as_ref().and_then(commitment_hash);
-                        if stored_h == Some(pin) {
-                            // Still the rejected commitment — clear it
-                            // but keep `commitment_capable` sticky.
-                            rec.last_commitment = None;
-                        }
-                        // else: a fresh commitment arrived in the meantime;
-                        // leave it untouched (don't clobber).
-                    }
-                    drop(last);
-                    // Drop credit anchored to the now-stale pin so the
-                    // peer must re-prove every key under the new
-                    // commitment to keep holder status (v12 §6).
-                    ctx.recent_provers.write().await.forget_commitment(&pin);
-                }
-                info!(
-                    "Audit: peer {challenged_peer} rotated past pinned commitment; \
-                     dropped stale pin and credits (no trust penalty)"
-                );
-                return AuditTickResult::Idle;
-            }
-            // v12 paragraph 5: "key not in commitment" is also a benign
-            // staleness signal, NOT a failure. The auditor sampled a key
-            // it holds and that the peer SHOULD hold (close-group), but
-            // which the peer hasn't yet committed to (e.g. just-replicated
-            // after their last rotation). Penalising this would punish
-            // honest peers who have the bytes but haven't rebuilt their
-            // Merkle tree yet (codex round-11 MAJOR #2).
-            if expected_commitment_hash.is_some() && reason.starts_with("key not in commitment") {
-                info!(
-                    "Audit: peer {challenged_peer} reports key-not-in-commitment; \
-                     skipping (responder commitment is stale relative to its key set)"
-                );
-                return AuditTickResult::Idle;
-            }
-            warn!("Audit: challenge rejected by {challenged_peer}: {reason}");
-            handle_audit_failure(
-                &challenged_peer,
-                challenge_id,
-                &peer_keys,
-                AuditFailureReason::Rejected,
-                p2p_node,
-                config,
-            )
-            .await
+            // ADR-0002: the auditor only ever pins a commitment the peer JUST
+            // gossiped, and an honest responder retains its last two gossiped
+            // commitments. So a rejection of a freshly pinned root is a
+            // confirmed failure (repudiating what you just published), not
+            // benign staleness. There is no no-penalty lane.
+            warn!("Audit: peer {challenged_peer} rejected subtree challenge: {reason}");
+            failed(challenged_peer, challenge_id, AuditFailureReason::Rejected)
         }
-        ReplicationMessageBody::AuditResponse(AuditResponse::CommitmentBound {
+        ReplicationMessageBody::SubtreeAuditResponse(SubtreeAuditResponse::Proof {
             challenge_id: resp_id,
             commitment,
-            per_key,
+            proof,
         }) => {
             if resp_id != challenge_id {
-                warn!("Audit: challenge ID mismatch on CommitmentBound from {challenged_peer}");
-                return handle_audit_failure(
-                    &challenged_peer,
-                    challenge_id,
-                    &peer_keys,
-                    AuditFailureReason::MalformedResponse,
-                    p2p_node,
-                    config,
-                )
-                .await;
+                return malformed();
             }
-            verify_commitment_bound(
-                &challenged_peer,
-                challenge_id,
-                &nonce,
-                &peer_keys,
-                expected_commitment_hash.as_ref(),
-                &commitment,
-                &per_key,
-                storage,
-                p2p_node,
-                config,
-                commitment_ctx,
-            )
-            .await
+            verify_subtree_response(ctx, &commitment, &proof).await
         }
         _ => {
             warn!("Audit: unexpected response type from {challenged_peer}");
-            handle_audit_failure(
-                &challenged_peer,
-                challenge_id,
-                &peer_keys,
-                AuditFailureReason::MalformedResponse,
-                p2p_node,
-                config,
-            )
-            .await
+            malformed()
         }
     }
 }
 
-fn eligible_audit_peers(sync_history: &HashMap<PeerId, PeerSyncRecord>) -> Vec<PeerId> {
-    sync_history
-        .iter()
-        .filter(|(_, record)| record.has_repair_opportunity())
-        .map(|(peer, _)| *peer)
-        .collect()
+/// The pure verdict of evaluating a subtree-audit response, independent of
+/// storage/network. Tests call this directly so the SHIPPED gate logic is what
+/// gets exercised (no reimplementation that could drift).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AuditVerdict {
+    /// All gates passed and at least one leaf was byte-verified.
+    Pass {
+        /// Number of leaves whose real bytes were verified in round 2.
+        checked: usize,
+    },
+    /// A confirmed failure with this reason (penalizable / acted upon).
+    Fail(AuditFailureReason),
 }
 
-fn mature_audit_keys_for_peer(
-    challenged_peer: &PeerId,
-    sampled_key_groups: Vec<(XorName, HashSet<PeerId>)>,
-    repair_proofs: &mut RepairProofs,
-    current_sync_epoch: u64,
-) -> Vec<XorName> {
-    sampled_key_groups
-        .into_iter()
-        .filter_map(|(key, close_peers)| {
-            repair_proofs
-                .has_mature_replica_hint(challenged_peer, &key, &close_peers, current_sync_epoch)
-                .then_some(key)
-        })
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Digest verification
-// ---------------------------------------------------------------------------
-
-/// Verify per-key digests from audit response (Step 8).
-#[allow(clippy::too_many_arguments)]
-async fn verify_digests(
-    challenged_peer: &PeerId,
-    challenge_id: u64,
-    nonce: &[u8; 32],
-    keys: &[XorName],
-    digests: &[[u8; 32]],
-    storage: &Arc<LmdbStorage>,
-    p2p_node: &Arc<P2PNode>,
-    config: &ReplicationConfig,
-) -> AuditTickResult {
-    // Requirement: response must have exactly one digest per key.
-    if digests.len() != keys.len() {
-        warn!(
-            "Audit: malformed response from {challenged_peer}: {} digests for {} keys",
-            digests.len(),
-            keys.len()
-        );
-        return handle_audit_failure(
-            challenged_peer,
-            challenge_id,
-            keys,
-            AuditFailureReason::MalformedResponse,
-            p2p_node,
-            config,
-        )
-        .await;
-    }
-
-    let challenged_peer_bytes = challenged_peer.as_bytes();
-    let mut failed_keys = Vec::new();
-
-    for (i, key) in keys.iter().enumerate() {
-        let received_digest = &digests[i];
-
-        // Check for absent sentinel.
-        if *received_digest == ABSENT_KEY_DIGEST {
-            failed_keys.push(*key);
-            continue;
-        }
-
-        // Recompute expected digest from local copy.
-        let local_bytes = match storage.get_raw(key).await {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => {
-                // We should hold this key (we sampled it), but it's gone.
-                warn!(
-                    "Audit: local key {} disappeared during audit",
-                    hex::encode(key)
-                );
-                continue;
-            }
-            Err(e) => {
-                warn!("Audit: failed to read local key {}: {e}", hex::encode(key));
-                continue;
-            }
-        };
-
-        let expected = compute_audit_digest(nonce, challenged_peer_bytes, key, &local_bytes);
-        if *received_digest != expected {
-            failed_keys.push(*key);
-        }
-    }
-
-    if failed_keys.is_empty() {
-        info!(
-            "Audit: peer {challenged_peer} passed (all {} keys verified)",
-            keys.len()
-        );
-        return AuditTickResult::Passed {
-            challenged_peer: *challenged_peer,
-            keys_checked: keys.len(),
-        };
-    }
-
-    // Step 9: Responsibility confirmation for failed keys.
-    handle_audit_failure(
-        challenged_peer,
-        challenge_id,
-        &failed_keys,
-        AuditFailureReason::DigestMismatch,
-        p2p_node,
-        config,
-    )
-    .await
-}
-
-// ---------------------------------------------------------------------------
-// Commitment-bound verification (v12)
-// ---------------------------------------------------------------------------
-
-/// Verify a `CommitmentBound` audit response (Step 8, v12 path).
+/// Round-1 structural evaluation of a subtree-audit proof (ADR-0002).
 ///
-/// Runs the pure verifier `verify_commitment_bound_response` against the
-/// commitment we pinned (NOT the one in the response — the response's
-/// commitment must hash-match the pin), then on success records the
-/// challenged peer as a recent prover for each verified key.
+/// Runs the cheap gates in fail-fast order: pin / identity / signature →
+/// structure (the returned subtree rebuilds to the pinned root). It does **not**
+/// prove byte possession — the leaves carry only the public `bytes_hash` (the
+/// chunk address) and a `nonced_hash` the responder computed itself. Possession
+/// is proven in round 2 ([`verify_byte_response`]), where the auditor demands
+/// the original chunk bytes for a nonce-selected sample and recomputes both
+/// hashes from the SERVED content. This removes any dependency on the auditor
+/// holding the peer's chunks.
 ///
-/// The verifier checks five gates: structural, peer-id binding, pin,
-/// signature (using the pubkey embedded in the commitment), and per-key
-/// (`bytes_hash` + Merkle path + audit digest). Any failure path → standard
-/// `AUDIT_FAILURE_TRUST_WEIGHT × keys` penalty.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn verify_commitment_bound(
-    challenged_peer: &PeerId,
-    challenge_id: u64,
+/// Returns [`StructureVerdict::Valid`] (proceed to round 2) or a confirmed
+/// [`AuditFailureReason`] mapped from the failing gate.
+pub(crate) fn evaluate_subtree_structure(
+    commitment: &StorageCommitment,
+    proof: &SubtreeProof,
     nonce: &[u8; 32],
-    keys: &[XorName],
-    expected_commitment_hash: Option<&[u8; 32]>,
-    response_commitment: &StorageCommitment,
-    response_per_key: &[CommitmentBoundResult],
-    storage: &Arc<LmdbStorage>,
-    p2p_node: &Arc<P2PNode>,
-    config: &ReplicationConfig,
-    commitment_ctx: Option<&CommitmentAuditCtx<'_>>,
-) -> AuditTickResult {
-    // Sanity: a CommitmentBound response must have been answered to a
-    // pinned challenge. If we didn't pin (or have no ctx), this is a
-    // protocol violation by the peer.
-    let Some(pin) = expected_commitment_hash else {
-        warn!(
-            "Audit: peer {challenged_peer} sent CommitmentBound for an unpinned challenge — \
-             treating as malformed"
-        );
-        return handle_audit_failure(
-            challenged_peer,
-            challenge_id,
-            keys,
-            AuditFailureReason::MalformedResponse,
-            p2p_node,
-            config,
-        )
-        .await;
+    expected_commitment_hash: &[u8; 32],
+    challenged_peer_bytes: &[u8; 32],
+) -> Result<(), AuditFailureReason> {
+    // -- Pin + identity + signature --
+    if &commitment.sender_peer_id != challenged_peer_bytes {
+        return Err(AuditFailureReason::Rejected);
+    }
+    let derived_peer_id = *blake3::hash(&commitment.sender_public_key).as_bytes();
+    if derived_peer_id != commitment.sender_peer_id {
+        return Err(AuditFailureReason::Rejected);
+    }
+    match commitment_hash(commitment) {
+        Some(h) if &h == expected_commitment_hash => {}
+        _ => return Err(AuditFailureReason::Rejected),
+    }
+    if !crate::replication::commitment::verify_commitment_signature(commitment) {
+        return Err(AuditFailureReason::Rejected);
+    }
+
+    // -- Structure --
+    if let StructureVerdict::Invalid(_) = verify_subtree_proof(proof, nonce, commitment) {
+        return Err(AuditFailureReason::DigestMismatch);
+    }
+    Ok(())
+}
+
+/// The auditor's nonce-derived spot-check sample of the round-1 subtree: the
+/// distinct leaves (in proof order) whose original bytes the auditor will demand
+/// in round 2. Empty only if the proof is empty (cannot happen post-structure).
+pub(crate) fn spotcheck_leaves<'a>(
+    proof: &'a SubtreeProof,
+    nonce: &[u8; 32],
+    key_count: u32,
+    spotcheck_count: u32,
+) -> Vec<&'a crate::replication::subtree::SubtreeLeaf> {
+    let Some(path) = select_subtree_path(nonce, key_count) else {
+        return Vec::new();
     };
-
-    // Metadata gates (structural / peer-id / pin / sig). One-shot, cheap.
-    if let Err(e) = verify_commitment_bound_metadata(
-        keys,
-        challenged_peer.as_bytes(),
-        pin,
-        response_commitment,
-        response_per_key,
-    ) {
-        warn!(
-            "Audit: peer {challenged_peer} failed commitment-bound metadata: {e} (pin={})",
-            hex::encode(pin),
-        );
-        return handle_audit_failure(
-            challenged_peer,
-            challenge_id,
-            keys,
-            AuditFailureReason::DigestMismatch,
-            p2p_node,
-            config,
-        )
-        .await;
+    let mut out = Vec::new();
+    for idx in select_spotcheck_indices(nonce, &path, spotcheck_count) {
+        if let Some(leaf) = proof.leaves.get(idx as usize) {
+            out.push(leaf);
+        }
     }
+    out
+}
 
-    // Per-key gates streamed one chunk at a time. Avoids the
-    // sqrt(n)*MAX_CHUNK_SIZE worst case of preloading every challenged
-    // chunk (~4 GiB at 1M stored chunks).
-    //
-    // Verified keys are collected for holder-credit attribution at the
-    // end of the loop. A key that disappears locally between sampling
-    // and verification is skipped without penalising the responder
-    // (matches the legacy `verify_digests` `continue` semantics; the
-    // responder is not at fault for the auditor's storage churn).
-    let mut verified_keys: Vec<XorName> = Vec::with_capacity(response_per_key.len());
-    let mut failed_keys: Vec<XorName> = Vec::new();
-    for (i, result) in response_per_key.iter().enumerate() {
-        let local_bytes = match storage.get_raw(&result.key).await {
-            Ok(Some(b)) => b,
-            Ok(None) => {
-                debug!(
-                    "Audit: local key {} disappeared between sampling and verification; skipping",
-                    hex::encode(result.key)
-                );
-                continue;
-            }
-            Err(e) => {
-                warn!(
-                    "Audit: failed to read local key {}: {e}",
-                    hex::encode(result.key)
-                );
-                continue;
-            }
+/// Round-2 verdict (ADR-0002): the responder served the original chunk content
+/// for the auditor's spot-check sample; verify possession from THAT content.
+///
+/// `served(key)` returns what the responder returned for a requested key:
+/// `Some(Some(bytes))` for [`SubtreeByteItem::Present`], `Some(None)` for an
+/// explicit [`SubtreeByteItem::Absent`], and `None` if the responder omitted the
+/// key entirely (treated like `Absent` — a committed key it would not serve).
+///
+/// For each sampled leaf the auditor recomputes, from the SERVED content:
+///   - `BLAKE3(content) == leaf.bytes_hash` (the chunk's content address), AND
+///   - `BLAKE3(nonce ‖ peer ‖ key ‖ content) == leaf.nonced_hash` (freshness),
+///     i.e. `compute_audit_digest(nonce, peer, key, content)`.
+///
+/// The freshness inputs are byte-identical to what the responder used to BUILD
+/// the leaf in round 1 (`subtree_leaf` → `nonced_leaf_hash`): the SAME four
+/// inputs, so an honest holder's served content reproduces `nonced_hash`
+/// exactly. Round 1 commits over the data (the `nonced_hash` is uncomputable
+/// without the bytes); round 2 reveals a random subset to prove the commitment
+/// was not fabricated.
+///
+/// Both checks are over the content the responder sent, so the auditor needs to
+/// hold none of the peer's chunks. Any `Absent`/omitted committed key, or any
+/// served content that fails a hash, is a provable lie → confirmed
+/// [`AuditFailureReason::DigestMismatch`]. All sampled leaves verifying →
+/// `Pass { checked }`.
+pub(crate) fn verify_byte_response(
+    leaves: &[&crate::replication::subtree::SubtreeLeaf],
+    nonce: &[u8; 32],
+    challenged_peer_bytes: &[u8; 32],
+    served: impl Fn(&XorName) -> Option<Option<Vec<u8>>>,
+) -> AuditVerdict {
+    let mut checked = 0usize;
+    for leaf in leaves {
+        // Present{bytes} -> Some(Some(bytes)); Absent -> Some(None); omitted -> None.
+        // A committed key the responder cannot / will not serve is a provable lie.
+        let Some(Some(content)) = served(&leaf.key) else {
+            return AuditVerdict::Fail(AuditFailureReason::DigestMismatch);
         };
-
-        if let Err(e) = verify_commitment_bound_per_key(
-            i,
+        let plain = *blake3::hash(&content).as_bytes();
+        let nonced = crate::replication::subtree::nonced_leaf_hash(
             nonce,
-            challenged_peer.as_bytes(),
-            response_commitment,
-            result,
-            &local_bytes,
-        ) {
-            warn!(
-                "Audit: peer {challenged_peer} failed commitment-bound per-key #{i}: {e} \
-                 (pin={})",
-                hex::encode(pin),
-            );
-            // Track only the failing key. Match the legacy
-            // `verify_digests` semantics: continue verifying other keys
-            // and penalise only the ones that actually failed, rather
-            // than escalating a single per-key failure to the whole
-            // challenge batch. `local_bytes` drops here, bounding peak
-            // memory at one chunk.
-            failed_keys.push(result.key);
-            continue;
+            challenged_peer_bytes,
+            &leaf.key,
+            &content,
+        );
+        if leaf.bytes_hash != plain || leaf.nonced_hash != nonced {
+            // Served content does not hash to the committed address / freshness
+            // hash: cannot be the chunk it committed to.
+            return AuditVerdict::Fail(AuditFailureReason::DigestMismatch);
         }
-        verified_keys.push(result.key);
+        checked += 1;
+    }
+    AuditVerdict::Pass { checked }
+}
+
+/// Verify a subtree-proof response (auditor side), ADR-0002 two-round audit.
+///
+/// **Round 1** (this proof): pin + identity + signature + structure. If the
+/// proof structurally rebuilds to the pinned root, the tree SHAPE is committed —
+/// but not yet that the bytes are held. **Round 2**: the auditor picks a small
+/// nonce-selected sample of the just-proven leaves and sends a
+/// [`SubtreeByteChallenge`] demanding their original chunk content FROM the
+/// responder, then verifies that content against the committed `bytes_hash`
+/// (content address) and `nonced_hash` (freshness). A responder that committed
+/// to a chunk it no longer holds cannot serve content that hashes to the
+/// committed address, so it fails — regardless of what the auditor holds. On a
+/// full pass, credits the peer as a proven holder.
+async fn verify_subtree_response(
+    ctx: &AuditCtx<'_>,
+    commitment: &StorageCommitment,
+    proof: &SubtreeProof,
+) -> AuditTickResult {
+    let challenged_peer = ctx.challenged_peer;
+    let challenge_id = ctx.challenge_id;
+
+    // -- Round 1: pin/identity/signature + structure (no bytes). --
+    if let Err(reason) = evaluate_subtree_structure(
+        commitment,
+        proof,
+        &ctx.nonce,
+        &ctx.expected_commitment_hash,
+        challenged_peer.as_bytes(),
+    ) {
+        warn!("Audit: {challenged_peer} failed subtree structure ({reason:?})");
+        return failed(challenged_peer, challenge_id, reason);
     }
 
-    if !failed_keys.is_empty() {
-        return handle_audit_failure(
+    // -- Round 2: surprise byte challenge for a 3..=5 nonce-selected sample. --
+    // The responder cannot predict which leaves are sampled, and must serve the
+    // ORIGINAL content for each. We cap the sample at the ADR's 3..=5 band
+    // (clamped to the subtree size) so the round-2 message and the responder's
+    // disk read stay cheap.
+    let sample_n = ctx
+        .config
+        .audit_spotcheck_count()
+        .clamp(BYTE_SPOTCHECK_MIN, BYTE_SPOTCHECK_MAX);
+    let sampled = spotcheck_leaves(proof, &ctx.nonce, commitment.key_count, sample_n);
+    if sampled.is_empty() {
+        // Cannot happen after a valid structure (subtree is never empty), but
+        // guard rather than credit an unproven peer.
+        warn!("Audit: {challenged_peer} produced an empty spot-check sample; rejecting");
+        return failed(
             challenged_peer,
             challenge_id,
-            &failed_keys,
             AuditFailureReason::DigestMismatch,
-            p2p_node,
-            config,
-        )
-        .await;
-    }
-
-    if verified_keys.is_empty() {
-        // Every challenged key was locally unavailable. We have no
-        // evidence either way — return Idle without trust events.
-        debug!(
-            "Audit: peer {challenged_peer} commitment-bound audit had no locally-verifiable keys"
         );
-        return AuditTickResult::Idle;
     }
+    let sampled_keys: Vec<XorName> = sampled.iter().map(|l| l.key).collect();
 
-    info!(
-        "Audit: peer {challenged_peer} passed commitment-bound audit ({}/{} keys verified, pin={})",
-        verified_keys.len(),
-        keys.len(),
-        hex::encode(pin),
-    );
-    // Credit the peer as a holder for each VERIFIED key under this
-    // exact commitment hash (skipped keys are not credited — we never
-    // confirmed them). Downstream (quorum, paid lists) can read
-    // `recent_provers.is_credited_holder(...)`.
-    if let Some(ctx) = commitment_ctx {
-        let now = std::time::Instant::now();
-        let mut guard = ctx.recent_provers.write().await;
-        for key in &verified_keys {
-            guard.record_proof(*key, *challenged_peer, *pin, now);
+    let verdict = match request_byte_proof(ctx, &sampled_keys).await {
+        ByteRound::Served(items) => {
+            verify_byte_response(&sampled, &ctx.nonce, challenged_peer.as_bytes(), |key| {
+                items.iter().find_map(|it| match it {
+                    SubtreeByteItem::Present { key: k, bytes } if k == key => {
+                        Some(Some(bytes.clone()))
+                    }
+                    SubtreeByteItem::Absent { key: k } if k == key => Some(None),
+                    _ => None,
+                })
+            })
         }
-    }
-    AuditTickResult::Passed {
-        challenged_peer: *challenged_peer,
-        keys_checked: verified_keys.len(),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Failure handling with responsibility confirmation
-// ---------------------------------------------------------------------------
-
-/// Handle audit failure: confirm responsibility before emitting evidence (Step 9).
-async fn handle_audit_failure(
-    challenged_peer: &PeerId,
-    challenge_id: u64,
-    failed_keys: &[XorName],
-    reason: AuditFailureReason,
-    p2p_node: &Arc<P2PNode>,
-    config: &ReplicationConfig,
-) -> AuditTickResult {
-    let dht = p2p_node.dht_manager();
-    let mut confirmed_failures = Vec::new();
-
-    // Step 9a-b: Fresh local RT lookup for each failed key.
-    for key in failed_keys {
-        let closest = dht
-            .find_closest_nodes_local_with_self(key, config.close_group_size)
-            .await;
-        if closest.iter().any(|n| n.peer_id == *challenged_peer) {
-            confirmed_failures.push(*key);
-        } else {
-            debug!(
-                "Audit: peer {challenged_peer} not responsible for {} (removed from failure set)",
-                hex::encode(key)
-            );
-        }
-    }
-
-    // Step 9c: Empty confirmed set -> peer is no longer responsible for any
-    // of the failed keys (topology churn). This is NOT a pass — the peer did
-    // not prove it stores the data. Return Idle to avoid granting unearned
-    // positive trust.
-    if confirmed_failures.is_empty() {
-        info!("Audit: all failures for {challenged_peer} cleared by responsibility confirmation");
-        return AuditTickResult::Idle;
-    }
-
-    // Step 9d: Non-empty confirmed set -> emit evidence.
-    let evidence = FailureEvidence::AuditFailure {
-        challenge_id,
-        challenged_peer: *challenged_peer,
-        confirmed_failed_keys: confirmed_failures,
-        reason,
+        // The responder rejected the byte challenge for a recently pinned
+        // commitment → confirmed failure, same as a round-1 rejection.
+        ByteRound::Rejected => AuditVerdict::Fail(AuditFailureReason::Rejected),
+        // No response within the byte deadline (or transport error) → timeout
+        // (graced by the caller's strike policy — could be honest slowness).
+        ByteRound::Timeout => AuditVerdict::Fail(AuditFailureReason::Timeout),
+        // Malformed/unexpected round-2 body.
+        ByteRound::Malformed => AuditVerdict::Fail(AuditFailureReason::MalformedResponse),
     };
 
-    AuditTickResult::Failed { evidence }
+    match verdict {
+        AuditVerdict::Fail(reason) => {
+            warn!("Audit: {challenged_peer} failed subtree audit ({reason:?})");
+            failed(challenged_peer, challenge_id, reason)
+        }
+        AuditVerdict::Pass { checked } => {
+            // Closeness (ADR-0002, soft/observe-only) — see observe_closeness.
+            observe_closeness(ctx.p2p_node, ctx.config, challenged_peer, proof).await;
+            // Credit the peer as a proven holder of its committed keys.
+            if let (Some(credit), Some(pin)) = (ctx.credit, commitment_hash(commitment)) {
+                let now = std::time::Instant::now();
+                let peer_hex = crate::replication::events::peer_hex(challenged_peer);
+                let pin_hex = crate::replication::events::hex32(&pin);
+                let mut provers = credit.recent_provers.write().await;
+                for leaf in &proof.leaves {
+                    provers.record_proof(leaf.key, *challenged_peer, pin, now);
+                    crate::replication::events::holder_credit_recorded(
+                        &peer_hex,
+                        &crate::replication::events::key_hex(&leaf.key),
+                        &pin_hex,
+                    );
+                }
+            }
+            info!(
+                "Audit: peer {challenged_peer} passed subtree audit ({} leaves, {checked} \
+                 byte-checked)",
+                proof.leaves.len()
+            );
+            crate::replication::events::audit_outcome(
+                &crate::replication::events::peer_hex(challenged_peer),
+                challenge_id,
+                "passed_subtree",
+                None,
+            );
+            AuditTickResult::Passed {
+                challenged_peer: *challenged_peer,
+                keys_checked: checked,
+            }
+        }
+    }
 }
 
-/// Handle audit timeout (no response received).
-async fn handle_audit_timeout(
-    challenged_peer: &PeerId,
-    challenge_id: u64,
-    keys: &[XorName],
+/// Soft, density-aware closeness observation (ADR-0002). Logs — never fails —
+/// when a suspicious fraction of the proof's leaves are keys the auditor itself
+/// is NOT responsible for (a proxy for "implausibly far from the peer").
+///
+/// Using the auditor's own `SelfInclusiveRT` responsibility as the yardstick
+/// makes this density-aware for free: on a small/dense network the auditor is
+/// close to nearly every key, so almost nothing reads as far and no honest peer
+/// is ever flagged. Enforcement is intentionally deferred until a testnet
+/// calibrates the density threshold.
+async fn observe_closeness(
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
+    challenged_peer: &PeerId,
+    proof: &SubtreeProof,
+) {
+    let self_id = *p2p_node.peer_id();
+    let mut far = 0usize;
+    for leaf in &proof.leaves {
+        if !crate::replication::admission::is_responsible(
+            &self_id,
+            &leaf.key,
+            p2p_node,
+            config.close_group_size,
+        )
+        .await
+        {
+            far += 1;
+        }
+    }
+    // Only worth a line when MOST of the proof is far — that's the padding
+    // shape. A normal proof on a sparse network has some far keys; that's fine.
+    let total = proof.leaves.len();
+    if total > 0 && far * 2 > total {
+        debug!(
+            "Audit: closeness signal — {far}/{total} of {challenged_peer}'s proven leaves are \
+             keys this auditor is not close to (observe-only; possible padding, not penalized)"
+        );
+    }
+}
+
+/// Build a confirmed-failure result. The auditor pinned a commitment the peer
+/// committed to itself, so there is no per-key responsibility to re-confirm:
+/// the failure is about the peer's own committed tree.
+fn failed(
+    challenged_peer: &PeerId,
+    challenge_id: u64,
+    reason: AuditFailureReason,
 ) -> AuditTickResult {
-    handle_audit_failure(
-        challenged_peer,
+    crate::replication::events::audit_outcome(
+        &crate::replication::events::peer_hex(challenged_peer),
         challenge_id,
-        keys,
-        AuditFailureReason::Timeout,
-        p2p_node,
-        config,
-    )
-    .await
+        "failed",
+        Some(audit_failure_gate(&reason)),
+    );
+    AuditTickResult::Failed {
+        evidence: FailureEvidence::AuditFailure {
+            challenge_id,
+            challenged_peer: *challenged_peer,
+            confirmed_failed_keys: Vec::new(),
+            reason,
+        },
+    }
+}
+
+/// Stable lowercase gate name for the v12 `audit_outcome` event's `gate` field.
+/// Matches the failure-reason taxonomy the analysis pipeline greps for.
+const fn audit_failure_gate(reason: &AuditFailureReason) -> &'static str {
+    match reason {
+        AuditFailureReason::Timeout => "timeout",
+        AuditFailureReason::MalformedResponse => "malformed_response",
+        AuditFailureReason::DigestMismatch => "digest_mismatch",
+        AuditFailureReason::KeyAbsent => "key_absent",
+        AuditFailureReason::Rejected => "rejected",
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Responder-side handler
+// Responder side
 // ---------------------------------------------------------------------------
 
-/// Handle an incoming audit challenge (responder side).
+/// Handle an incoming subtree audit challenge (responder side).
 ///
-/// Validates that the challenge targets this node, computes per-key digests,
-/// and returns the response.  Rejects challenges where
-/// `challenged_peer_id` does not match `self_peer_id` to prevent an oracle
-/// attack where a malicious challenger forges digests for a different peer.
-pub async fn handle_audit_challenge(
-    challenge: &AuditChallenge,
+/// Validates the challenge targets this node, looks up the pinned commitment in
+/// the retained (last-two-gossiped) set, and builds the subtree proof for the
+/// nonce-selected branch. If this node is bootstrapping it says so; if it
+/// genuinely does not retain the pinned commitment it rejects (which the
+/// auditor treats as a confirmed failure for a recently gossiped root).
+pub async fn handle_subtree_challenge(
+    challenge: &SubtreeAuditChallenge,
     storage: &LmdbStorage,
     self_peer_id: &PeerId,
     is_bootstrapping: bool,
-    stored_chunks: usize,
-) -> AuditResponse {
-    handle_audit_challenge_with_commitment(
-        challenge,
-        storage,
-        self_peer_id,
-        is_bootstrapping,
-        stored_chunks,
-        None,
-    )
-    .await
-}
-
-/// Like [`handle_audit_challenge`] but also accepts a responder's
-/// `ResponderCommitmentState`. If the challenge carries
-/// `expected_commitment_hash: Some(h)`, dispatches to the v12
-/// commitment-bound response path (gates: structural / pin / signature
-/// / per-key path+digest); otherwise falls through to the legacy
-/// plain-digest path.
-///
-/// Backwards-compatible: existing callers that don't have a
-/// `ResponderCommitmentState` keep calling `handle_audit_challenge`,
-/// which forwards here with `commitment_state = None`.
-#[allow(clippy::too_long_first_doc_paragraph, clippy::too_many_lines)]
-pub async fn handle_audit_challenge_with_commitment(
-    challenge: &AuditChallenge,
-    storage: &LmdbStorage,
-    self_peer_id: &PeerId,
-    is_bootstrapping: bool,
-    stored_chunks: usize,
-    commitment_state: Option<
-        &std::sync::Arc<crate::replication::commitment_state::ResponderCommitmentState>,
-    >,
-) -> AuditResponse {
+    commitment_state: Option<&Arc<ResponderCommitmentState>>,
+) -> SubtreeAuditResponse {
     if is_bootstrapping {
-        return AuditResponse::Bootstrapping {
+        return SubtreeAuditResponse::Bootstrapping {
+            challenge_id: challenge.challenge_id,
+        };
+    }
+
+    // Adversary `bootstrap-shield` mode (testnet-only, never in production):
+    // answer EVERY subtree challenge with `Bootstrapping` for the node's whole
+    // lifetime. It never produces a proof (so it is never credited as a holder),
+    // and the auditor's bootstrap-claim-abuse grace detector flags it once the
+    // grace period elapses. No-op without the `adversary` feature.
+    #[cfg(feature = "adversary")]
+    if crate::adversary::is_bootstrap_shield() {
+        warn!("adversary bootstrap-shield: answering subtree challenge with Bootstrapping");
+        return SubtreeAuditResponse::Bootstrapping {
             challenge_id: challenge.challenge_id,
         };
     }
 
     if challenge.challenged_peer_id != *self_peer_id.as_bytes() {
         warn!(
-            "Audit challenge targeted wrong peer: expected {}, got {}",
+            "Subtree audit challenge targeted wrong peer: expected {}, got {}",
             hex::encode(self_peer_id.as_bytes()),
             hex::encode(challenge.challenged_peer_id),
         );
-        return AuditResponse::Rejected {
+        return SubtreeAuditResponse::Rejected {
             challenge_id: challenge.challenge_id,
             reason: "challenged_peer_id does not match this node".to_string(),
         };
     }
 
-    let max_keys = ReplicationConfig::max_incoming_audit_keys(stored_chunks);
-    if challenge.keys.len() > max_keys {
+    let Some(state) = commitment_state else {
+        return SubtreeAuditResponse::Rejected {
+            challenge_id: challenge.challenge_id,
+            reason: "no commitment state".to_string(),
+        };
+    };
+
+    // Look up the pinned commitment among the last-two-gossiped retained set.
+    let Some(built) = state.lookup_by_hash(&challenge.expected_commitment_hash) else {
+        return SubtreeAuditResponse::Rejected {
+            challenge_id: challenge.challenge_id,
+            reason: "unknown commitment hash".to_string(),
+        };
+    };
+
+    // Adversary `relay` mode (testnet-only, never in production): a relay
+    // dropped its committed bytes and would have to fetch the subtree's chunks
+    // from a neighbour before it could answer. There is no in-tree neighbour
+    // fetch-by-key API the responder can call inline here, so we implement the
+    // simplest faithful version of the relay's OBSERVABLE signature: stall past
+    // any plausible audit deadline so the auditor's `send_request` times out
+    // (counted as `AuditFailureReason::Timeout` → strike/grace, not a confirmed
+    // failure — which is exactly the relay's detection lane per ADR-0002). The
+    // sleep is bounded so the responder task can't be parked forever. No-op
+    // without the `adversary` feature.
+    #[cfg(feature = "adversary")]
+    if crate::adversary::is_relay() {
         warn!(
-            "Audit challenge rejected: {} keys exceeds dynamic limit of {max_keys} \
-             (stored_chunks={stored_chunks})",
-            challenge.keys.len(),
+            "adversary relay: stalling subtree response past the audit deadline \
+             (simulating fetch-from-neighbour latency)"
         );
-        return AuditResponse::Rejected {
-            challenge_id: challenge.challenge_id,
-            reason: format!(
-                "challenge contains {} keys, limit is {max_keys}",
-                challenge.keys.len()
-            ),
-        };
+        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
     }
 
-    // v12 commitment-bound path: when the auditor pinned a specific
-    // commitment, look it up in our state and produce a CommitmentBound
-    // response. If we don't have that commitment (rotated away, never
-    // gossiped, etc.) reject with reason="unknown commitment hash" —
-    // the auditor's v12 paragraph 5 handler keeps the pin (no penalty)
-    // and waits for fresh gossip to replace it.
-    if let (Some(expected_hash), Some(state)) = (
-        challenge.expected_commitment_hash.as_ref(),
-        commitment_state,
-    ) {
-        // Precheck WITHOUT reading any chunk bytes (codex round-9 MAJOR:
-        // the prior preload-into-HashMap pattern hit O(sample×4MiB)
-        // peak memory). Cheap: hash-map lookup + per-key proof_for.
-        let built = match crate::replication::commitment_state::precheck_commitment_bound_challenge(
-            state,
-            expected_hash,
-            &challenge.keys,
-        ) {
-            Ok(b) => b,
-            Err(
-                crate::replication::commitment_state::CommitmentBoundOutcome::UnknownCommitmentHash,
-            ) => {
-                return AuditResponse::Rejected {
-                    challenge_id: challenge.challenge_id,
-                    reason: "unknown commitment hash".to_string(),
-                };
-            }
-            Err(
-                crate::replication::commitment_state::CommitmentBoundOutcome::KeyNotInCommitment {
-                    key,
-                },
-            ) => {
-                return AuditResponse::Rejected {
-                    challenge_id: challenge.challenge_id,
-                    reason: format!("key not in commitment: {}", hex::encode(key)),
-                };
-            }
-            Err(_) => {
-                // precheck only returns UnknownCommitmentHash /
-                // KeyNotInCommitment today. Reject gracefully rather
-                // than panic if a future variant is added — the
-                // project bans panics on production paths.
-                return AuditResponse::Rejected {
-                    challenge_id: challenge.challenge_id,
-                    reason: "unrecognized commitment precheck outcome".to_string(),
-                };
-            }
-        };
-
-        // Stream per-key: read one chunk, build its proof entry, drop
-        // the bytes, move to the next. Peak memory is bounded at
-        // MAX_CHUNK_SIZE (4 MiB) regardless of sample size.
-        let mut per_key = Vec::with_capacity(challenge.keys.len());
-        for key in &challenge.keys {
-            let Ok(Some(bytes)) = storage.get_raw(key).await else {
-                // Key IS in the commitment (precheck above ensured
-                // it) but we cannot read the bytes anymore. That's
-                // real storage loss / deliberate non-response, not
-                // benign staleness. Use a distinct reason string so
-                // the auditor penalises (codex round-12 MAJOR #1).
-                return AuditResponse::Rejected {
-                    challenge_id: challenge.challenge_id,
-                    reason: format!("missing bytes for committed key: {}", hex::encode(key)),
-                };
+    // Geometry first (no bytes touched): which leaves to prove + the sibling
+    // cut-hashes from the committed tree.
+    let plan = match subtree_plan(built.tree(), &challenge.nonce) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("Subtree audit: failed to plan proof: {e:?}");
+            return SubtreeAuditResponse::Rejected {
+                challenge_id: challenge.challenge_id,
+                reason: "could not build subtree proof".to_string(),
             };
-            let Some(entry) =
-                crate::replication::commitment_state::build_commitment_bound_result_for_key(
-                    &built,
-                    key,
-                    &challenge.nonce,
-                    &challenge.challenged_peer_id,
-                    &bytes,
-                )
-            else {
-                // Precheck guaranteed proof_for(key) returns Some, so
-                // this is unreachable. Defensive only.
-                return AuditResponse::Rejected {
-                    challenge_id: challenge.challenge_id,
-                    reason: format!("key not in commitment: {}", hex::encode(key)),
-                };
+        }
+    };
+
+    // Read chunk bytes one leaf at a time so peak memory is bounded regardless
+    // of subtree size, hashing each into its plain + nonced leaf.
+    let mut leaves = Vec::with_capacity(plan.leaf_keys.len());
+    for key in &plan.leaf_keys {
+        let Ok(Some(bytes)) = storage.get_raw(key).await else {
+            // Key is in our committed tree but we cannot read its bytes — real
+            // storage loss / deliberate non-response. For a recently gossiped
+            // pin the auditor counts this rejection as a confirmed failure.
+            warn!(
+                "Subtree audit: missing bytes for committed key {}",
+                hex::encode(key)
+            );
+            return SubtreeAuditResponse::Rejected {
+                challenge_id: challenge.challenge_id,
+                reason: format!("missing bytes for committed key: {}", hex::encode(key)),
             };
-            per_key.push(entry);
-            // bytes drops here.
-        }
-
-        return AuditResponse::CommitmentBound {
-            challenge_id: challenge.challenge_id,
-            commitment: built.commitment().clone(),
-            per_key,
         };
+        // Adversary `fake-storage` mode (testnet-only, never in production):
+        // claim possession but serve GARBAGE bytes for each leaf. The leaf's
+        // `bytes_hash`/`nonced_hash` are then computed over bytes the node does
+        // not really hold, so the auditor's structure rebuild (root ≠ pinned
+        // commitment) and real-bytes spot-check both fail → confirmed
+        // `DigestMismatch`. This is the "Present but cannot prove it" lane. The
+        // garbage is derived from the key so the response is deterministic for a
+        // given challenge. No-op without the `adversary` feature.
+        #[cfg(feature = "adversary")]
+        let bytes = if crate::adversary::is_fake_storage() {
+            let mut garbage = blake3::hash(key).as_bytes().to_vec();
+            garbage.extend_from_slice(b"adversary-fake-storage");
+            garbage
+        } else {
+            bytes
+        };
+        leaves.push(crate::replication::subtree::subtree_leaf(
+            &challenge.nonce,
+            &challenge.challenged_peer_id,
+            key,
+            &bytes,
+        ));
+        // bytes drops here.
     }
 
-    // Legacy plain-digest path (unchanged from pre-v12).
-    let mut digests = Vec::with_capacity(challenge.keys.len());
-
-    for key in &challenge.keys {
-        match storage.get_raw(key).await {
-            Ok(Some(data)) => {
-                let digest = compute_audit_digest(
-                    &challenge.nonce,
-                    &challenge.challenged_peer_id,
-                    key,
-                    &data,
-                );
-                digests.push(digest);
-            }
-            Ok(None) => {
-                digests.push(ABSENT_KEY_DIGEST);
-            }
-            Err(e) => {
-                warn!(
-                    "Audit responder: failed to read key {}: {e}",
-                    hex::encode(key)
-                );
-                digests.push(ABSENT_KEY_DIGEST);
-            }
-        }
-    }
-
-    AuditResponse::Digests {
+    SubtreeAuditResponse::Proof {
         challenge_id: challenge.challenge_id,
-        digests,
+        commitment: built.commitment().clone(),
+        proof: SubtreeProof {
+            leaves,
+            sibling_cut_hashes: plan.sibling_cut_hashes,
+        },
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+/// Handle a round-2 byte challenge (responder side), ADR-0002.
+///
+/// The auditor has already structurally verified this node's round-1 subtree
+/// proof and now demands the ORIGINAL chunk bytes for a small nonce-selected
+/// sample of those leaves. For each requested key the responder either returns
+/// the bytes ([`SubtreeByteItem::Present`]) or — if it committed to the key but
+/// can no longer produce it — an explicit [`SubtreeByteItem::Absent`], which the
+/// auditor counts as a provable failure (committing to bytes you don't hold).
+///
+/// A key the responder never committed to (not in the pinned tree) is also
+/// returned `Absent`: the auditor only ever samples keys it saw in round 1, so
+/// in practice this guards against a malformed/forged byte challenge rather than
+/// an honest mismatch.
+pub async fn handle_subtree_byte_challenge(
+    challenge: &SubtreeByteChallenge,
+    storage: &LmdbStorage,
+    self_peer_id: &PeerId,
+    is_bootstrapping: bool,
+    commitment_state: Option<&Arc<ResponderCommitmentState>>,
+) -> SubtreeByteResponse {
+    if is_bootstrapping {
+        return SubtreeByteResponse::Bootstrapping {
+            challenge_id: challenge.challenge_id,
+        };
+    }
+
+    // Adversary `bootstrap-shield` (testnet-only): keep claiming bootstrap so it
+    // never proves possession. Same lane as round 1.
+    #[cfg(feature = "adversary")]
+    if crate::adversary::is_bootstrap_shield() {
+        return SubtreeByteResponse::Bootstrapping {
+            challenge_id: challenge.challenge_id,
+        };
+    }
+
+    if challenge.challenged_peer_id != *self_peer_id.as_bytes() {
+        return SubtreeByteResponse::Rejected {
+            challenge_id: challenge.challenge_id,
+            reason: "challenged_peer_id does not match this node".to_string(),
+        };
+    }
+
+    let Some(state) = commitment_state else {
+        return SubtreeByteResponse::Rejected {
+            challenge_id: challenge.challenge_id,
+            reason: "no commitment state".to_string(),
+        };
+    };
+    // Resolve the SAME commitment the auditor pinned in round 1. If we no longer
+    // retain it (it aged out of the last-two-gossiped set), reject — for a
+    // recently gossiped pin the auditor treats this as a confirmed failure, like
+    // round 1. We serve bytes only for keys actually committed to under this pin.
+    let Some(built) = state.lookup_by_hash(&challenge.expected_commitment_hash) else {
+        return SubtreeByteResponse::Rejected {
+            challenge_id: challenge.challenge_id,
+            reason: "unknown commitment hash".to_string(),
+        };
+    };
+    let committed = |key: &XorName| -> bool { built.proof_for(key).is_some() };
+
+    // Adversary `relay` (testnet-only): a relay holds none of the real bytes and
+    // would have to fetch each requested chunk from a neighbour. As in round 1,
+    // model its observable signature by stalling past the deadline so the
+    // auditor's byte request times out (graced Timeout, not a confirmed failure).
+    #[cfg(feature = "adversary")]
+    if crate::adversary::is_relay() {
+        warn!(
+            "adversary relay: stalling byte-challenge response past the deadline \
+             (simulating fetch-from-neighbour latency)"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+    }
+
+    let mut items = Vec::with_capacity(challenge.keys.len());
+    for key in &challenge.keys {
+        // Read the original bytes for the requested, committed key.
+        if let Ok(Some(bytes)) = storage.get_raw(key).await {
+            // Adversary `fake-storage` (testnet-only): claim possession but
+            // return GARBAGE bytes. `BLAKE3(garbage) != key`, so the auditor's
+            // content-address check fails → confirmed `DigestMismatch`. This is
+            // the "present but cannot prove it" lane, now enforced on the bytes
+            // the responder actually serves.
+            #[cfg(feature = "adversary")]
+            let bytes = if crate::adversary::is_fake_storage() {
+                let mut garbage = blake3::hash(key).as_bytes().to_vec();
+                garbage.extend_from_slice(b"adversary-fake-storage");
+                garbage
+            } else {
+                bytes
+            };
+            items.push(SubtreeByteItem::Present { key: *key, bytes });
+        } else {
+            // Committed to the key but cannot read its bytes → provable failure.
+            if committed(key) {
+                warn!(
+                    "Subtree byte audit: committed key {} requested but bytes absent",
+                    hex::encode(key)
+                );
+            }
+            items.push(SubtreeByteItem::Absent { key: *key });
+        }
+    }
+
+    SubtreeByteResponse::Items {
+        challenge_id: challenge.challenge_id,
+        items,
+    }
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::replication::protocol::compute_audit_digest;
-    use crate::replication::types::{BootstrapClaimObservation, NeighborSyncState};
-    use crate::storage::LmdbStorageConfig;
-    use std::time::Instant;
-    use tempfile::TempDir;
+    use crate::replication::commitment_state::BuiltCommitment;
+    use crate::replication::subtree::{
+        build_subtree_proof, nonced_leaf_hash, select_subtree_path, SubtreeLeaf,
+    };
+    use saorsa_pqc::api::sig::ml_dsa_65;
 
-    /// Simulated stored chunk count for tests. Large enough that the dynamic
-    /// incoming audit limit (`2 * sqrt(N)`) never rejects small test challenges.
-    const TEST_STORED_CHUNKS: usize = 1_000_000;
+    // The two-round audit splits into SHIPPED pure functions exercised directly
+    // here (no reimplementation that could drift):
+    //   - round 1: `evaluate_subtree_structure` (pin/identity/signature +
+    //     structural root rebuild),
+    //   - sampling: `spotcheck_leaves` (the 3..=5 nonce-selected leaves), and
+    //   - round 2: `verify_byte_response` (recompute content-address + freshness
+    //     from the bytes the RESPONDER served — the auditor holds nothing).
 
-    /// Create a test `LmdbStorage` backed by a temp directory.
-    async fn create_test_storage() -> (LmdbStorage, TempDir) {
-        let temp_dir = TempDir::new().expect("create temp dir");
-        let config = LmdbStorageConfig {
-            root_dir: temp_dir.path().to_path_buf(),
-            verify_on_read: false,
-            max_map_size: 0,
-            disk_reserve: 0,
-        };
-        let storage = LmdbStorage::new(config).await.expect("create storage");
-        (storage, temp_dir)
+    fn key(i: u32) -> XorName {
+        let mut k = [0u8; 32];
+        k[..4].copy_from_slice(&i.to_be_bytes());
+        k
+    }
+    /// The "chunk content" for a key in these fixtures. The committed tree's leaf
+    /// `bytes_hash` is `BLAKE3(chunk_bytes(key))`, mirroring the general
+    /// `(key, BLAKE3(content))` commitment; round 2 serves exactly this content.
+    fn chunk_bytes(k: &XorName) -> Vec<u8> {
+        let mut v = k.to_vec();
+        v.extend_from_slice(b"chunk-body");
+        v
     }
 
-    /// Build a challenge with the given parameters.
-    fn make_challenge(
-        challenge_id: u64,
-        nonce: [u8; 32],
-        peer_id: [u8; 32],
-        keys: Vec<XorName>,
-    ) -> AuditChallenge {
-        AuditChallenge {
-            challenge_id,
-            nonce,
-            challenged_peer_id: peer_id,
-            keys,
-            expected_commitment_hash: None,
-        }
-    }
-
-    /// Build a `PeerId` matching the raw bytes used in a challenge.
-    fn peer_id_from_bytes(bytes: [u8; 32]) -> PeerId {
-        PeerId::from_bytes(bytes)
-    }
-
-    // -- handle_audit_challenge: present keys ---------------------------------
-
-    #[tokio::test]
-    async fn handle_challenge_present_keys_returns_correct_digests() {
-        let (storage, _temp) = create_test_storage().await;
-
-        // Store two chunks.
-        let content_a = b"chunk alpha";
-        let addr_a = LmdbStorage::compute_address(content_a);
-        storage.put(&addr_a, content_a).await.expect("put a");
-
-        let content_b = b"chunk beta";
-        let addr_b = LmdbStorage::compute_address(content_b);
-        storage.put(&addr_b, content_b).await.expect("put b");
-
-        let nonce = [0xAA; 32];
-        let peer_id = [0xBB; 32];
-        let challenge = make_challenge(42, nonce, peer_id, vec![addr_a, addr_b]);
-        let self_id = peer_id_from_bytes(peer_id);
-
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, false, TEST_STORED_CHUNKS).await;
-
-        match response {
-            AuditResponse::Digests {
-                challenge_id,
-                digests,
-            } => {
-                assert_eq!(challenge_id, 42);
-                assert_eq!(digests.len(), 2);
-
-                let expected_a = compute_audit_digest(&nonce, &peer_id, &addr_a, content_a);
-                let expected_b = compute_audit_digest(&nonce, &peer_id, &addr_b, content_b);
-                assert_eq!(digests[0], expected_a);
-                assert_eq!(digests[1], expected_b);
-            }
-            AuditResponse::Bootstrapping { .. } => {
-                panic!("expected Digests, got Bootstrapping");
-            }
-            AuditResponse::Rejected { .. } => {
-                panic!("Unexpected Rejected response");
-            }
-            AuditResponse::CommitmentBound { .. } => {
-                panic!("Unexpected CommitmentBound response in legacy-digest test")
-            }
-        }
-    }
-
-    // -- handle_audit_challenge: absent keys ----------------------------------
-
-    #[tokio::test]
-    async fn handle_challenge_absent_keys_returns_sentinel() {
-        let (storage, _temp) = create_test_storage().await;
-
-        let absent_key = [0xFF; 32];
-        let nonce = [0x11; 32];
-        let peer_id = [0x22; 32];
-        let challenge = make_challenge(99, nonce, peer_id, vec![absent_key]);
-        let self_id = peer_id_from_bytes(peer_id);
-
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, false, TEST_STORED_CHUNKS).await;
-
-        match response {
-            AuditResponse::Digests {
-                challenge_id,
-                digests,
-            } => {
-                assert_eq!(challenge_id, 99);
-                assert_eq!(digests.len(), 1);
-                assert_eq!(
-                    digests[0], ABSENT_KEY_DIGEST,
-                    "absent key should produce sentinel digest"
-                );
-            }
-            AuditResponse::Bootstrapping { .. } => {
-                panic!("expected Digests, got Bootstrapping");
-            }
-            AuditResponse::Rejected { .. } => {
-                panic!("Unexpected Rejected response");
-            }
-            AuditResponse::CommitmentBound { .. } => {
-                panic!("Unexpected CommitmentBound response in legacy-digest test")
-            }
-        }
-    }
-
-    // -- handle_audit_challenge: mixed present and absent ---------------------
-
-    #[tokio::test]
-    async fn handle_challenge_mixed_present_and_absent() {
-        let (storage, _temp) = create_test_storage().await;
-
-        let content = b"present chunk";
-        let addr_present = LmdbStorage::compute_address(content);
-        storage.put(&addr_present, content).await.expect("put");
-
-        let addr_absent = [0xDE; 32];
-        let nonce = [0x33; 32];
-        let peer_id = [0x44; 32];
-        let challenge = make_challenge(7, nonce, peer_id, vec![addr_present, addr_absent]);
-        let self_id = peer_id_from_bytes(peer_id);
-
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, false, TEST_STORED_CHUNKS).await;
-
-        match response {
-            AuditResponse::Digests { digests, .. } => {
-                assert_eq!(digests.len(), 2);
-
-                let expected_present =
-                    compute_audit_digest(&nonce, &peer_id, &addr_present, content);
-                assert_eq!(digests[0], expected_present);
-                assert_eq!(
-                    digests[1], ABSENT_KEY_DIGEST,
-                    "absent key should be sentinel"
-                );
-            }
-            AuditResponse::Bootstrapping { .. } => {
-                panic!("expected Digests, got Bootstrapping");
-            }
-            AuditResponse::Rejected { .. } => {
-                panic!("Unexpected Rejected response");
-            }
-            AuditResponse::CommitmentBound { .. } => {
-                panic!("Unexpected CommitmentBound response in legacy-digest test")
-            }
-        }
-    }
-
-    // -- handle_audit_challenge: bootstrapping --------------------------------
-
-    #[tokio::test]
-    async fn handle_challenge_bootstrapping_returns_bootstrapping_response() {
-        let (storage, _temp) = create_test_storage().await;
-
-        let challenge = make_challenge(55, [0x00; 32], [0x01; 32], vec![[0x02; 32]]);
-        let self_id = peer_id_from_bytes([0x01; 32]);
-
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, true, TEST_STORED_CHUNKS).await;
-
-        match response {
-            AuditResponse::Bootstrapping { challenge_id } => {
-                assert_eq!(challenge_id, 55);
-            }
-            AuditResponse::Digests { .. } => {
-                panic!("expected Bootstrapping, got Digests");
-            }
-            AuditResponse::Rejected { .. } => {
-                panic!("Unexpected Rejected response");
-            }
-            AuditResponse::CommitmentBound { .. } => {
-                panic!("Unexpected CommitmentBound response in legacy-digest test")
-            }
-        }
-    }
-
-    // -- handle_audit_challenge: empty key list -------------------------------
-
-    #[tokio::test]
-    async fn handle_challenge_empty_keys_returns_empty_digests() {
-        let (storage, _temp) = create_test_storage().await;
-
-        let challenge = make_challenge(100, [0x10; 32], [0x20; 32], vec![]);
-        let self_id = peer_id_from_bytes([0x20; 32]);
-
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, false, TEST_STORED_CHUNKS).await;
-
-        match response {
-            AuditResponse::Digests {
-                challenge_id,
-                digests,
-            } => {
-                assert_eq!(challenge_id, 100);
-                assert!(
-                    digests.is_empty(),
-                    "empty key list should yield empty digests"
-                );
-            }
-            AuditResponse::Bootstrapping { .. } => {
-                panic!("expected Digests, got Bootstrapping");
-            }
-            AuditResponse::Rejected { .. } => {
-                panic!("Unexpected Rejected response");
-            }
-            AuditResponse::CommitmentBound { .. } => {
-                panic!("Unexpected CommitmentBound response in legacy-digest test")
-            }
-        }
-    }
-
-    // -- Digest verification: matching ----------------------------------------
-
-    #[test]
-    fn digest_verification_matching() {
-        let nonce = [0x01; 32];
-        let peer_id = [0x02; 32];
-        let key: XorName = [0x03; 32];
-        let data = b"correct data";
-
-        let expected = compute_audit_digest(&nonce, &peer_id, &key, data);
-        let recomputed = compute_audit_digest(&nonce, &peer_id, &key, data);
-
-        assert_eq!(
-            expected, recomputed,
-            "same inputs must produce identical digests"
-        );
-        assert_ne!(
-            expected, ABSENT_KEY_DIGEST,
-            "real digest must not be sentinel"
-        );
-    }
-
-    // -- Digest verification: mismatching -------------------------------------
-
-    #[test]
-    fn digest_verification_mismatching_data() {
-        let nonce = [0x01; 32];
-        let peer_id = [0x02; 32];
-        let key: XorName = [0x03; 32];
-
-        let digest_a = compute_audit_digest(&nonce, &peer_id, &key, b"data version A");
-        let digest_b = compute_audit_digest(&nonce, &peer_id, &key, b"data version B");
-
-        assert_ne!(
-            digest_a, digest_b,
-            "different data must produce different digests"
-        );
-    }
-
-    #[test]
-    fn digest_verification_mismatching_nonce() {
-        let peer_id = [0x02; 32];
-        let key: XorName = [0x03; 32];
-        let data = b"same data";
-
-        let digest_a = compute_audit_digest(&[0x01; 32], &peer_id, &key, data);
-        let digest_b = compute_audit_digest(&[0xFF; 32], &peer_id, &key, data);
-
-        assert_ne!(
-            digest_a, digest_b,
-            "different nonces must produce different digests"
-        );
-    }
-
-    #[test]
-    fn digest_verification_mismatching_peer() {
-        let nonce = [0x01; 32];
-        let key: XorName = [0x03; 32];
-        let data = b"same data";
-
-        let digest_a = compute_audit_digest(&nonce, &[0x02; 32], &key, data);
-        let digest_b = compute_audit_digest(&nonce, &[0xFE; 32], &key, data);
-
-        assert_ne!(
-            digest_a, digest_b,
-            "different peers must produce different digests"
-        );
-    }
-
-    #[test]
-    fn digest_verification_mismatching_key() {
-        let nonce = [0x01; 32];
-        let peer_id = [0x02; 32];
-        let data = b"same data";
-
-        let digest_a = compute_audit_digest(&nonce, &peer_id, &[0x03; 32], data);
-        let digest_b = compute_audit_digest(&nonce, &peer_id, &[0xFC; 32], data);
-
-        assert_ne!(
-            digest_a, digest_b,
-            "different keys must produce different digests"
-        );
-    }
-
-    // -- Absent sentinel is all zeros -----------------------------------------
-
-    #[test]
-    fn absent_sentinel_is_all_zeros() {
-        assert_eq!(ABSENT_KEY_DIGEST, [0u8; 32], "sentinel must be all zeros");
-    }
-
-    // -- Bootstrapping skips digest computation even with stored keys ---------
-
-    #[tokio::test]
-    async fn bootstrapping_skips_digest_computation() {
-        let (storage, _temp) = create_test_storage().await;
-
-        let content = b"stored but bootstrapping";
-        let addr = LmdbStorage::compute_address(content);
-        storage.put(&addr, content).await.expect("put");
-
-        let challenge = make_challenge(200, [0xCC; 32], [0xDD; 32], vec![addr]);
-        let self_id = peer_id_from_bytes([0xDD; 32]);
-
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, true, TEST_STORED_CHUNKS).await;
-
-        assert!(
-            matches!(response, AuditResponse::Bootstrapping { challenge_id: 200 }),
-            "bootstrapping node must not compute digests"
-        );
-    }
-
-    // -- Scenario 19/53: Partial failure with mixed responsibility ----------------
-
-    #[tokio::test]
-    async fn scenario_19_partial_failure_mixed_responsibility() {
-        // Three keys challenged: K1 matches, K2 mismatches, K3 absent.
-        // After responsibility confirmation, only K2 is confirmed responsible.
-        // AuditFailure emitted for {K2} only.
-        // Test handle_audit_challenge with mixed results, then verify
-        // the digest logic manually.
-
-        let (storage, _temp) = create_test_storage().await;
-        let nonce = [0x42u8; 32];
-        let peer_id = [0xAA; 32];
-
-        // Store K1 and K2, but NOT K3
-        let content_k1 = b"key one data";
-        let addr_k1 = LmdbStorage::compute_address(content_k1);
-        storage.put(&addr_k1, content_k1).await.unwrap();
-
-        let content_k2 = b"key two data";
-        let addr_k2 = LmdbStorage::compute_address(content_k2);
-        storage.put(&addr_k2, content_k2).await.unwrap();
-
-        let addr_k3 = [0xFF; 32]; // Not stored
-
-        let challenge = AuditChallenge {
-            challenge_id: 100,
-            nonce,
-            challenged_peer_id: peer_id,
-            keys: vec![addr_k1, addr_k2, addr_k3],
-            expected_commitment_hash: None,
-        };
-        let self_id = peer_id_from_bytes(peer_id);
-
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, false, TEST_STORED_CHUNKS).await;
-
-        match response {
-            AuditResponse::Digests { digests, .. } => {
-                assert_eq!(digests.len(), 3);
-
-                // K1 should have correct digest
-                let expected_k1 = compute_audit_digest(&nonce, &peer_id, &addr_k1, content_k1);
-                assert_eq!(digests[0], expected_k1);
-
-                // K2 should have correct digest
-                let expected_k2 = compute_audit_digest(&nonce, &peer_id, &addr_k2, content_k2);
-                assert_eq!(digests[1], expected_k2);
-
-                // K3 absent -> sentinel
-                assert_eq!(digests[2], ABSENT_KEY_DIGEST);
-            }
-            AuditResponse::Bootstrapping { .. } => panic!("Expected Digests response"),
-            AuditResponse::Rejected { .. } => panic!("Unexpected Rejected response"),
-            AuditResponse::CommitmentBound { .. } => {
-                panic!("Unexpected CommitmentBound response in legacy-digest test")
-            }
-        }
-    }
-
-    // -- Scenario 54: All digests pass -------------------------------------------
-
-    #[tokio::test]
-    async fn scenario_54_all_digests_pass() {
-        // All challenged keys present and digests match.
-        // Multiple keys to strengthen coverage beyond existing two-key tests.
-        let (storage, _temp) = create_test_storage().await;
-        let nonce = [0x10; 32];
-        let peer_id = [0x20; 32];
-
-        let c1 = b"chunk alpha";
-        let c2 = b"chunk beta";
-        let c3 = b"chunk gamma";
-        let a1 = LmdbStorage::compute_address(c1);
-        let a2 = LmdbStorage::compute_address(c2);
-        let a3 = LmdbStorage::compute_address(c3);
-        storage.put(&a1, c1).await.unwrap();
-        storage.put(&a2, c2).await.unwrap();
-        storage.put(&a3, c3).await.unwrap();
-
-        let challenge = AuditChallenge {
-            challenge_id: 200,
-            nonce,
-            challenged_peer_id: peer_id,
-            keys: vec![a1, a2, a3],
-            expected_commitment_hash: None,
-        };
-        let self_id = peer_id_from_bytes(peer_id);
-
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, false, TEST_STORED_CHUNKS).await;
-        match response {
-            AuditResponse::Digests { digests, .. } => {
-                assert_eq!(digests.len(), 3);
-                for (i, (addr, content)) in [(a1, &c1[..]), (a2, &c2[..]), (a3, &c3[..])]
-                    .iter()
-                    .enumerate()
-                {
-                    let expected = compute_audit_digest(&nonce, &peer_id, addr, content);
-                    assert_eq!(digests[i], expected, "Key {i} digest should match");
-                }
-            }
-            AuditResponse::Bootstrapping { .. } => panic!("Expected Digests"),
-            AuditResponse::Rejected { .. } => panic!("Unexpected Rejected response"),
-            AuditResponse::CommitmentBound { .. } => {
-                panic!("Unexpected CommitmentBound response in legacy-digest test")
-            }
-        }
-    }
-
-    // -- Scenario 55: Empty failure set means no evidence -------------------------
-
-    /// Scenario 55: Peer challenged on {K1, K2}. Both digests mismatch.
-    /// Responsibility confirmation shows the peer is NOT responsible for
-    /// either key. The confirmed failure set is empty — no `AuditFailure`
-    /// evidence is emitted.
-    ///
-    /// Full `verify_digests` requires a live `P2PNode` for network lookups.
-    /// This test exercises the deterministic sub-steps:
-    ///   (1) Digest comparison identifies K1 and K2 as mismatches.
-    ///   (2) Responsibility confirmation removes both keys.
-    ///   (3) Empty confirmed failure set means no evidence.
-    #[tokio::test]
-    async fn scenario_55_no_confirmed_responsibility_no_evidence() {
-        let (storage, _temp) = create_test_storage().await;
-        let nonce = [0x55; 32];
-        let peer_id = [0x55; 32];
-
-        // Store K1 and K2 on the challenger (for expected digest computation).
-        let c1 = b"scenario 55 key one";
-        let c2 = b"scenario 55 key two";
-        let k1 = LmdbStorage::compute_address(c1);
-        let k2 = LmdbStorage::compute_address(c2);
-        storage.put(&k1, c1).await.expect("put k1");
-        storage.put(&k2, c2).await.expect("put k2");
-
-        // Challenger computes expected digests.
-        let expected_d1 = compute_audit_digest(&nonce, &peer_id, &k1, c1);
-        let expected_d2 = compute_audit_digest(&nonce, &peer_id, &k2, c2);
-
-        // Simulate peer returning WRONG digests for both keys.
-        let wrong_d1 = compute_audit_digest(&nonce, &peer_id, &k1, b"corrupted k1");
-        let wrong_d2 = compute_audit_digest(&nonce, &peer_id, &k2, b"corrupted k2");
-        assert_ne!(wrong_d1, expected_d1, "K1 digest should mismatch");
-        assert_ne!(wrong_d2, expected_d2, "K2 digest should mismatch");
-
-        // Step 1: Identify failed keys via digest comparison.
-        let keys = [k1, k2];
-        let expected = [expected_d1, expected_d2];
-        let received = [wrong_d1, wrong_d2];
-
-        let mut failed_keys = Vec::new();
-        for i in 0..keys.len() {
-            if received[i] != expected[i] {
-                failed_keys.push(keys[i]);
-            }
-        }
-        assert_eq!(
-            failed_keys.len(),
-            2,
-            "Both keys should be identified as digest mismatches"
-        );
-
-        // Step 2: Responsibility confirmation — peer is NOT responsible for
-        // either key (simulated by filtering them all out).
-        let confirmed_responsible_keys: Vec<XorName> = Vec::new();
-        let confirmed_failures: Vec<XorName> = failed_keys
-            .into_iter()
-            .filter(|k| confirmed_responsible_keys.contains(k))
+    /// Build an honest committed tree of `n` keys + a valid round-1 proof for
+    /// `nonce`. Returns `(built, proof, peer_id)`. The auditor pins `built.hash()`.
+    fn honest(n: u32, nonce: &[u8; 32]) -> (BuiltCommitment, SubtreeProof, [u8; 32]) {
+        let (pk, sk) = ml_dsa_65().generate_keypair().unwrap();
+        let peer_id = *blake3::hash(&pk.to_bytes()).as_bytes();
+        let pk_b = pk.to_bytes();
+        let entries: Vec<_> = (0..n)
+            .map(|i| {
+                let k = key(i);
+                (k, *blake3::hash(&chunk_bytes(&k)).as_bytes())
+            })
             .collect();
+        let built = BuiltCommitment::build(entries, &peer_id, &sk, &pk_b).unwrap();
+        let proof =
+            build_subtree_proof(built.tree(), nonce, &peer_id, |k| Some(chunk_bytes(k))).unwrap();
+        (built, proof, peer_id)
+    }
 
-        // Step 3: Empty confirmed failure set → no AuditFailure evidence.
-        assert!(
-            confirmed_failures.is_empty(),
-            "With no confirmed responsibility, failure set must be empty — \
-             no AuditFailure evidence should be emitted"
-        );
+    /// Round-1 verdict against the pinned commitment.
+    fn structure(
+        built: &BuiltCommitment,
+        proof: &SubtreeProof,
+        nonce: &[u8; 32],
+        peer: &[u8; 32],
+    ) -> Result<(), AuditFailureReason> {
+        evaluate_subtree_structure(built.commitment(), proof, nonce, &built.hash(), peer)
+    }
 
-        // Verify that constructing evidence with empty keys results in a
-        // no-penalty outcome (the caller checks is_empty before emitting).
-        let peer = PeerId::from_bytes(peer_id);
-        let evidence = FailureEvidence::AuditFailure {
-            challenge_id: 5500,
-            challenged_peer: peer,
-            confirmed_failed_keys: confirmed_failures,
-            reason: AuditFailureReason::DigestMismatch,
-        };
-        if let FailureEvidence::AuditFailure {
-            confirmed_failed_keys,
-            ..
-        } = evidence
-        {
-            assert!(
-                confirmed_failed_keys.is_empty(),
-                "Evidence with empty failure set should not trigger a trust penalty"
-            );
+    /// The 3..=5 spot-check leaves the auditor would demand bytes for in round 2.
+    fn sample<'a>(proof: &'a SubtreeProof, nonce: &[u8; 32], n: u32) -> Vec<&'a SubtreeLeaf> {
+        spotcheck_leaves(
+            proof,
+            nonce,
+            n,
+            8u32.clamp(BYTE_SPOTCHECK_MIN, BYTE_SPOTCHECK_MAX),
+        )
+    }
+
+    // A round-2 `served` closure that returns the HONEST content for every key.
+    fn served_honest(key: &XorName) -> Option<Option<Vec<u8>>> {
+        Some(Some(chunk_bytes(key)))
+    }
+
+    // ---- round 1: structure --------------------------------------------------
+
+    #[test]
+    fn honest_structure_then_bytes_passes() {
+        let nonce = [9u8; 32];
+        let (built, proof, peer) = honest(400, &nonce);
+        // Round 1.
+        assert!(structure(&built, &proof, &nonce, &peer).is_ok());
+        // Round 2: honest responder serves the real content for the sample.
+        let s = sample(&proof, &nonce, built.commitment().key_count);
+        assert!(!s.is_empty());
+        match verify_byte_response(&s, &nonce, &peer, served_honest) {
+            AuditVerdict::Pass { checked } => assert!(checked >= 1, "must verify >=1 leaf"),
+            other => panic!("expected Pass, got {other:?}"),
         }
     }
 
-    // -- Scenario 56: RepairOpportunity filters never-synced peers ----------------
-
     #[test]
-    fn scenario_56_repair_opportunity_filters_never_synced() {
-        // PeerSyncRecord with last_sync=None should not pass
-        // has_repair_opportunity().
-
-        let never_synced = PeerSyncRecord {
-            last_sync: None,
-            cycles_since_sync: 5,
-        };
-        assert!(!never_synced.has_repair_opportunity());
-
-        let synced_no_cycle = PeerSyncRecord {
-            last_sync: Some(Instant::now()),
-            cycles_since_sync: 0,
-        };
-        assert!(!synced_no_cycle.has_repair_opportunity());
-
-        let synced_with_cycle = PeerSyncRecord {
-            last_sync: Some(Instant::now()),
-            cycles_since_sync: 1,
-        };
-        assert!(synced_with_cycle.has_repair_opportunity());
-    }
-
-    #[test]
-    fn expired_bootstrap_claim_does_not_remove_peer_from_audit_eligibility() {
-        let peer = peer_id_from_bytes([0x57; 32]);
-        let mut sync_history = HashMap::new();
-        sync_history.insert(
-            peer,
-            PeerSyncRecord {
-                last_sync: Some(Instant::now()),
-                cycles_since_sync: 1,
-            },
-        );
-
-        let mut bootstrap_claims = HashMap::new();
-        let first_seen = Instant::now()
-            .checked_sub(
-                crate::replication::config::BOOTSTRAP_CLAIM_GRACE_PERIOD
-                    + std::time::Duration::from_secs(1),
-            )
-            .unwrap_or_else(Instant::now);
-        bootstrap_claims.insert(peer, first_seen);
-
-        let eligible = eligible_audit_peers(&sync_history);
-
-        assert!(bootstrap_claims.contains_key(&peer));
-        assert!(
-            eligible.contains(&peer),
-            "continued bootstrap claims must remain auditable so past-grace abuse can be observed"
-        );
-    }
-
-    #[test]
-    fn audit_key_filter_retains_stable_proofs_and_rejects_evicted_peers() {
-        const HINT_EPOCH: u64 = 7;
-        const CURRENT_EPOCH: u64 = HINT_EPOCH + 1;
-        const CHALLENGED_PEER_BYTE: u8 = 0xA1;
-        const OTHER_PEER_BYTE: u8 = 0xA2;
-        const NEW_PEER_BYTE: u8 = 0xA3;
-        const MATURE_KEY_BYTE: u8 = 0xB1;
-        const SAME_EPOCH_KEY_BYTE: u8 = 0xB2;
-        const MISSING_PROOF_KEY_BYTE: u8 = 0xB3;
-        const STABLE_CHURN_KEY_BYTE: u8 = 0xB4;
-        const EVICTED_KEY_BYTE: u8 = 0xB5;
-        const XOR_NAME_LEN: usize = 32;
-
-        let challenged_peer = peer_id_from_bytes([CHALLENGED_PEER_BYTE; XOR_NAME_LEN]);
-        let other_peer = peer_id_from_bytes([OTHER_PEER_BYTE; XOR_NAME_LEN]);
-        let new_peer = peer_id_from_bytes([NEW_PEER_BYTE; XOR_NAME_LEN]);
-        let mature_key = [MATURE_KEY_BYTE; XOR_NAME_LEN];
-        let same_epoch_key = [SAME_EPOCH_KEY_BYTE; XOR_NAME_LEN];
-        let missing_proof_key = [MISSING_PROOF_KEY_BYTE; XOR_NAME_LEN];
-        let stable_churn_key = [STABLE_CHURN_KEY_BYTE; XOR_NAME_LEN];
-        let evicted_key = [EVICTED_KEY_BYTE; XOR_NAME_LEN];
-        let close_group = HashSet::from([challenged_peer, other_peer]);
-        let changed_close_group = HashSet::from([challenged_peer, new_peer]);
-        let evicted_close_group = HashSet::from([other_peer, new_peer]);
-        let mut repair_proofs = RepairProofs::new();
-
-        assert!(repair_proofs.record_replica_hint_sent(
-            challenged_peer,
-            mature_key,
-            &close_group,
-            HINT_EPOCH,
-        ));
-        assert!(repair_proofs.record_replica_hint_sent(
-            challenged_peer,
-            same_epoch_key,
-            &close_group,
-            CURRENT_EPOCH,
-        ));
-        assert!(repair_proofs.record_replica_hint_sent(
-            challenged_peer,
-            stable_churn_key,
-            &close_group,
-            HINT_EPOCH,
-        ));
-        assert!(repair_proofs.record_replica_hint_sent(
-            challenged_peer,
-            evicted_key,
-            &close_group,
-            HINT_EPOCH,
-        ));
-
-        let sampled_key_groups = vec![
-            (mature_key, close_group.clone()),
-            (same_epoch_key, close_group.clone()),
-            (missing_proof_key, close_group.clone()),
-            (stable_churn_key, changed_close_group),
-            (evicted_key, evicted_close_group),
-        ];
-        let peer_keys = mature_audit_keys_for_peer(
-            &challenged_peer,
-            sampled_key_groups,
-            &mut repair_proofs,
-            CURRENT_EPOCH,
-        );
-
+    fn commitment_bound_to_another_peer_rejected() {
+        let nonce = [3u8; 32];
+        let (built, proof, _peer) = honest(200, &nonce);
+        let other = [0xAAu8; 32];
         assert_eq!(
-            peer_keys,
-            vec![mature_key, stable_churn_key],
-            "mature proofs for stable close-group peers should become audit keys, while same-epoch, missing, and evicted-peer proofs should not"
+            structure(&built, &proof, &nonce, &other),
+            Err(AuditFailureReason::Rejected)
         );
     }
-
-    // -- Audit response must match key count --------------------------------------
-
-    #[tokio::test]
-    async fn audit_response_must_match_key_count() {
-        // Section 15: "A response is invalid if it has fewer or more entries
-        // than challenged keys."
-        // Verify handle_audit_challenge always produces exactly N digests for
-        // N keys, including edge cases.
-
-        let (storage, _temp) = create_test_storage().await;
-        let nonce = [0x50; 32];
-        let peer_id = [0x60; 32];
-
-        // Store a single chunk
-        let content = b"single chunk";
-        let addr = LmdbStorage::compute_address(content);
-        storage.put(&addr, content).await.unwrap();
-
-        // Challenge with 1 stored + 4 absent = 5 keys total
-        let absent_keys: Vec<XorName> = (1..=4u8).map(|i| [i; 32]).collect();
-        let mut keys = vec![addr];
-        keys.extend_from_slice(&absent_keys);
-
-        let key_count = keys.len();
-        let challenge = make_challenge(300, nonce, peer_id, keys);
-        let self_id = peer_id_from_bytes(peer_id);
-
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, false, TEST_STORED_CHUNKS).await;
-        match response {
-            AuditResponse::Digests { digests, .. } => {
-                assert_eq!(
-                    digests.len(),
-                    key_count,
-                    "must produce exactly one digest per challenged key"
-                );
-            }
-            AuditResponse::Bootstrapping { .. } => panic!("Expected Digests"),
-            AuditResponse::Rejected { .. } => panic!("Unexpected Rejected response"),
-            AuditResponse::CommitmentBound { .. } => {
-                panic!("Unexpected CommitmentBound response in legacy-digest test")
-            }
-        }
-    }
-
-    // -- Audit digest uses full record bytes --------------------------------------
 
     #[test]
-    fn audit_digest_uses_full_record_bytes() {
-        // Verify digest changes when record content changes.
-        let nonce = [1u8; 32];
-        let peer = [2u8; 32];
-        let key = [3u8; 32];
-
-        let d1 = compute_audit_digest(&nonce, &peer, &key, b"data version 1");
-        let d2 = compute_audit_digest(&nonce, &peer, &key, b"data version 2");
-        assert_ne!(
-            d1, d2,
-            "Different record bytes must produce different digests"
+    fn wrong_pinned_commitment_rejected() {
+        let nonce = [3u8; 32];
+        let (built, proof, peer) = honest(200, &nonce);
+        let mut wrong_pin = built.hash();
+        wrong_pin[0] ^= 0x01;
+        assert_eq!(
+            evaluate_subtree_structure(built.commitment(), &proof, &nonce, &wrong_pin, &peer),
+            Err(AuditFailureReason::Rejected)
         );
     }
 
-    // -- Scenario 29: Audit start gate ------------------------------------------
-
-    /// Scenario 29: `handle_audit_challenge` returns `Bootstrapping` when the
-    /// node is still bootstrapping — audit digests are never computed, and no
-    /// `AuditFailure` evidence is emitted by the caller.
-    ///
-    /// This is the responder-side gate.  The challenger-side gate is enforced
-    /// by `audit_tick`'s `is_bootstrapping` guard (Invariant 19) and by
-    /// `check_bootstrap_drained()` in the engine loop; this test confirms the
-    /// complementary responder behavior.
-    #[tokio::test]
-    async fn scenario_29_audit_start_gate_during_bootstrap() {
-        let (storage, _temp) = create_test_storage().await;
-
-        // Store data so there *would* be work to audit.
-        let content = b"should not be audited during bootstrap";
-        let addr = LmdbStorage::compute_address(content);
-        storage.put(&addr, content).await.expect("put");
-
-        let challenge = make_challenge(2900, [0x29; 32], [0x29; 32], vec![addr]);
-        let self_id = peer_id_from_bytes([0x29; 32]);
-
-        // Responder is bootstrapping → Bootstrapping response, NOT Digests.
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, true, TEST_STORED_CHUNKS).await;
-        assert!(
-            matches!(
-                response,
-                AuditResponse::Bootstrapping { challenge_id: 2900 }
-            ),
-            "bootstrapping node must not compute digests — audit start gate"
-        );
-
-        // Responder is NOT bootstrapping → normal Digests.
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, false, TEST_STORED_CHUNKS).await;
-        assert!(
-            matches!(response, AuditResponse::Digests { .. }),
-            "drained node should compute digests normally"
-        );
-    }
-
-    // -- Scenario 30: Audit peer selection from sampled keys --------------------
-
-    /// Scenario 30: Key sampling uses dynamic sqrt-based batch sizing and
-    /// `RepairOpportunity` filtering excludes never-synced peers.
-    ///
-    /// Full `audit_tick` requires a live network.  This test verifies the two
-    /// deterministic sub-steps the function relies on:
-    ///   (a) `audit_sample_count` scales with `sqrt(total_keys)`.
-    ///   (b) `PeerSyncRecord::has_repair_opportunity` gates peer eligibility.
     #[test]
-    fn scenario_30_audit_peer_selection_from_sampled_keys() {
-        // (a) Dynamic sample count scales with sqrt(total_keys).
+    fn tampered_leaf_structure_rejected() {
+        let nonce = [3u8; 32];
+        let (built, mut proof, peer) = honest(200, &nonce);
+        if let Some(first) = proof.leaves.first_mut() {
+            first.bytes_hash[0] ^= 0x01; // breaks root reconstruction
+        }
         assert_eq!(
-            ReplicationConfig::audit_sample_count(100),
-            10,
-            "sample count should scale with sqrt(total_keys)"
-        );
-
-        assert_eq!(ReplicationConfig::audit_sample_count(3), 1, "sqrt(3) = 1");
-
-        assert_eq!(
-            ReplicationConfig::audit_sample_count(10_000),
-            100,
-            "sqrt(10000) = 100"
-        );
-
-        // (b) Peer eligibility via RepairOpportunity.
-        // Never synced → not eligible.
-        let never = PeerSyncRecord {
-            last_sync: None,
-            cycles_since_sync: 10,
-        };
-        assert!(!never.has_repair_opportunity());
-
-        // Synced but zero subsequent cycles → not eligible.
-        let too_soon = PeerSyncRecord {
-            last_sync: Some(Instant::now()),
-            cycles_since_sync: 0,
-        };
-        assert!(!too_soon.has_repair_opportunity());
-
-        // Synced with ≥1 cycle → eligible.
-        let eligible = PeerSyncRecord {
-            last_sync: Some(Instant::now()),
-            cycles_since_sync: 2,
-        };
-        assert!(eligible.has_repair_opportunity());
-    }
-
-    // -- Scenario 32: Dynamic challenge size ------------------------------------
-
-    /// Scenario 32: Challenge key count equals `|PeerKeySet(challenged_peer)|`,
-    /// which is dynamic per round.  If no eligible peer remains after filtering,
-    /// the tick is idle.
-    ///
-    /// Verified via `handle_audit_challenge`: the response digest count always
-    /// equals the number of keys in the challenge.
-    #[tokio::test]
-    async fn scenario_32_dynamic_challenge_size() {
-        let (storage, _temp) = create_test_storage().await;
-
-        // Store varying numbers of chunks.
-        let mut addrs = Vec::new();
-        for i in 0u8..5 {
-            let content = format!("dynamic challenge key {i}");
-            let addr = LmdbStorage::compute_address(content.as_bytes());
-            storage.put(&addr, content.as_bytes()).await.expect("put");
-            addrs.push(addr);
-        }
-
-        let nonce = [0x32; 32];
-        let peer_id = [0x32; 32];
-        let self_id = peer_id_from_bytes(peer_id);
-
-        // Challenge with 1 key.
-        let challenge1 = make_challenge(3201, nonce, peer_id, vec![addrs[0]]);
-        let resp1 =
-            handle_audit_challenge(&challenge1, &storage, &self_id, false, TEST_STORED_CHUNKS)
-                .await;
-        if let AuditResponse::Digests { digests, .. } = resp1 {
-            assert_eq!(digests.len(), 1, "|PeerKeySet| = 1 → 1 digest");
-        }
-
-        // Challenge with 3 keys.
-        let challenge3 = make_challenge(3203, nonce, peer_id, addrs[0..3].to_vec());
-        let resp3 =
-            handle_audit_challenge(&challenge3, &storage, &self_id, false, TEST_STORED_CHUNKS)
-                .await;
-        if let AuditResponse::Digests { digests, .. } = resp3 {
-            assert_eq!(digests.len(), 3, "|PeerKeySet| = 3 → 3 digests");
-        }
-
-        // Challenge with all 5 keys.
-        let challenge5 = make_challenge(3205, nonce, peer_id, addrs.clone());
-        let resp5 =
-            handle_audit_challenge(&challenge5, &storage, &self_id, false, TEST_STORED_CHUNKS)
-                .await;
-        if let AuditResponse::Digests { digests, .. } = resp5 {
-            assert_eq!(digests.len(), 5, "|PeerKeySet| = 5 → 5 digests");
-        }
-
-        // Challenge with 0 keys (idle equivalent — no work).
-        let challenge0 = make_challenge(3200, nonce, peer_id, vec![]);
-        let resp0 =
-            handle_audit_challenge(&challenge0, &storage, &self_id, false, TEST_STORED_CHUNKS)
-                .await;
-        if let AuditResponse::Digests { digests, .. } = resp0 {
-            assert!(digests.is_empty(), "|PeerKeySet| = 0 → 0 digests (idle)");
-        }
-    }
-
-    // -- Scenario 47: Bootstrap claim grace period (audit) ----------------------
-
-    /// Scenario 47: Challenged peer responds with bootstrapping claim during
-    /// audit.  `handle_audit_challenge` returns `Bootstrapping`; caller records
-    /// `BootstrapClaimFirstSeen`.  No `AuditFailure` evidence is emitted.
-    #[tokio::test]
-    async fn scenario_47_bootstrap_claim_grace_period_audit() {
-        let (storage, _temp) = create_test_storage().await;
-
-        // Store data so there is an auditable key.
-        let content = b"bootstrap grace test";
-        let addr = LmdbStorage::compute_address(content);
-        storage.put(&addr, content).await.expect("put");
-
-        let challenge = make_challenge(4700, [0x47; 32], [0x47; 32], vec![addr]);
-        let self_id = peer_id_from_bytes([0x47; 32]);
-
-        // Bootstrapping peer → Bootstrapping response (grace period start).
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, true, TEST_STORED_CHUNKS).await;
-        let challenge_id = match response {
-            AuditResponse::Bootstrapping { challenge_id } => challenge_id,
-            AuditResponse::Digests { .. } => {
-                panic!("Expected Bootstrapping response during grace period")
-            }
-            AuditResponse::Rejected { .. } => {
-                panic!("Unexpected Rejected response")
-            }
-            AuditResponse::CommitmentBound { .. } => {
-                panic!("Unexpected CommitmentBound response in legacy-digest test")
-            }
-        };
-        assert_eq!(challenge_id, 4700);
-
-        // Caller records BootstrapClaimFirstSeen — verify the types support it.
-        let peer = PeerId::from_bytes([0x47; 32]);
-        let mut state = NeighborSyncState::new_cycle(vec![peer]);
-        let now = Instant::now();
-        let observed = state.observe_bootstrap_claim(
-            peer,
-            now,
-            crate::replication::config::BOOTSTRAP_CLAIM_GRACE_PERIOD,
-        );
-
-        assert_eq!(
-            observed,
-            BootstrapClaimObservation::WithinGrace { first_seen: now }
-        );
-        assert!(
-            state.bootstrap_claims.contains_key(&peer),
-            "BootstrapClaimFirstSeen should be recorded after grace-period claim"
-        );
-        assert!(
-            state.bootstrap_claim_history.contains_key(&peer),
-            "Bootstrap claim history should remember that the grace window was used"
+            structure(&built, &proof, &nonce, &peer),
+            Err(AuditFailureReason::DigestMismatch)
         );
     }
 
-    // -- Scenario 53: Audit partial per-key failure with mixed responsibility ---
+    #[test]
+    fn wrong_leaf_count_structure_rejected() {
+        let nonce = [3u8; 32];
+        let (built, mut proof, peer) = honest(200, &nonce);
+        proof.leaves.pop();
+        assert_eq!(
+            structure(&built, &proof, &nonce, &peer),
+            Err(AuditFailureReason::DigestMismatch)
+        );
+    }
 
-    /// Scenario 53: P challenged on {K1, K2, K3}.  K1 matches, K2 and K3
-    /// mismatch.  Responsibility confirmation: P is responsible for K2 but
-    /// not K3.  `AuditFailure` emitted for {K2} only.
-    ///
-    /// Full `verify_digests` + `handle_audit_failure` requires a `P2PNode` for
-    /// network lookups.  This test verifies the conceptual steps:
-    ///   (1) Digest comparison correctly identifies K2 and K3 as failures.
-    ///   (2) `FailureEvidence::AuditFailure` carries only confirmed keys.
-    #[tokio::test]
-    async fn scenario_53_partial_failure_mixed_responsibility() {
-        let (storage, _temp) = create_test_storage().await;
-        let nonce = [0x53; 32];
-        let peer_id = [0x53; 32];
+    // ---- round 2: responder-served bytes ------------------------------------
 
-        // Store K1, K2, K3.
-        let c1 = b"scenario 53 key one";
-        let c2 = b"scenario 53 key two";
-        let c3 = b"scenario 53 key three";
-        let k1 = LmdbStorage::compute_address(c1);
-        let k2 = LmdbStorage::compute_address(c2);
-        let k3 = LmdbStorage::compute_address(c3);
-        storage.put(&k1, c1).await.expect("put k1");
-        storage.put(&k2, c2).await.expect("put k2");
-        storage.put(&k3, c3).await.expect("put k3");
-
-        // Correct digests from challenger's local store.
-        let d1_expected = compute_audit_digest(&nonce, &peer_id, &k1, c1);
-        let d2_expected = compute_audit_digest(&nonce, &peer_id, &k2, c2);
-        let d3_expected = compute_audit_digest(&nonce, &peer_id, &k3, c3);
-
-        // Simulate peer response: K1 matches, K2 wrong data, K3 wrong data.
-        let d2_wrong = compute_audit_digest(&nonce, &peer_id, &k2, b"tampered k2");
-        let d3_wrong = compute_audit_digest(&nonce, &peer_id, &k3, b"tampered k3");
-
-        assert_eq!(d1_expected, d1_expected, "K1 should match");
-        assert_ne!(d2_wrong, d2_expected, "K2 should mismatch");
-        assert_ne!(d3_wrong, d3_expected, "K3 should mismatch");
-
-        // Step 1: Identify failed keys (digest comparison).
-        let digests = [d1_expected, d2_wrong, d3_wrong];
-        let keys = [k1, k2, k3];
-        let contents: [&[u8]; 3] = [c1, c2, c3];
-
-        let mut failed_keys = Vec::new();
-        for (i, key) in keys.iter().enumerate() {
-            if digests[i] == ABSENT_KEY_DIGEST {
-                failed_keys.push(*key);
-                continue;
-            }
-            let expected = compute_audit_digest(&nonce, &peer_id, key, contents[i]);
-            if digests[i] != expected {
-                failed_keys.push(*key);
-            }
-        }
-
-        assert_eq!(failed_keys.len(), 2, "K2 and K3 should be in failure set");
-        assert!(failed_keys.contains(&k2));
-        assert!(failed_keys.contains(&k3));
-        assert!(!failed_keys.contains(&k1), "K1 passed digest check");
-
-        // Step 2: Responsibility confirmation removes K3 (not responsible).
-        // Simulate: P is in closest peers for K2 but not K3.
-        let responsible_for_k2 = true;
-        let responsible_for_k3 = false;
-        let mut confirmed = Vec::new();
-        for key in &failed_keys {
-            let is_responsible = if *key == k2 {
-                responsible_for_k2
+    #[test]
+    fn deleter_absent_bytes_is_confirmed_failure() {
+        // THE headline fix: a node whose round-1 proof is structurally perfect
+        // but which has DELETED a committed chunk cannot serve its bytes. It
+        // signals `Absent` for the sampled key → provable lie → confirmed
+        // failure. Crucially, the auditor holds NONE of the peer's chunks; the
+        // verdict depends only on what the responder serves.
+        let nonce = [9u8; 32];
+        let (built, proof, peer) = honest(400, &nonce);
+        assert!(structure(&built, &proof, &nonce, &peer).is_ok());
+        let s = sample(&proof, &nonce, built.commitment().key_count);
+        // Responder returns Absent for the FIRST sampled key, honest for the rest.
+        let victim = s.first().map(|l| l.key).unwrap();
+        let v = verify_byte_response(&s, &nonce, &peer, |k| {
+            if *k == victim {
+                Some(None) // explicit Absent
             } else {
-                responsible_for_k3
-            };
-            if is_responsible {
-                confirmed.push(*key);
+                Some(Some(chunk_bytes(k)))
+            }
+        });
+        assert_eq!(v, AuditVerdict::Fail(AuditFailureReason::DigestMismatch));
+    }
+
+    #[test]
+    fn omitted_committed_key_is_confirmed_failure() {
+        // A responder that simply omits a sampled committed key from its items
+        // (neither Present nor Absent) is treated identically to Absent: it
+        // committed to the key and won't serve it → confirmed failure.
+        let nonce = [9u8; 32];
+        let (built, proof, peer) = honest(400, &nonce);
+        let s = sample(&proof, &nonce, built.commitment().key_count);
+        let victim = s.first().map(|l| l.key).unwrap();
+        let v = verify_byte_response(&s, &nonce, &peer, |k| {
+            if *k == victim {
+                None // omitted entirely
+            } else {
+                Some(Some(chunk_bytes(k)))
+            }
+        });
+        assert_eq!(v, AuditVerdict::Fail(AuditFailureReason::DigestMismatch));
+    }
+
+    #[test]
+    fn fake_storage_garbage_bytes_is_confirmed_failure() {
+        // A "fake-storage" responder claims possession but serves garbage. The
+        // garbage does not hash to the committed content address (`bytes_hash`),
+        // so the round-2 content-address check fails → confirmed failure. No
+        // auditor holdings involved.
+        let nonce = [9u8; 32];
+        let (built, proof, peer) = honest(400, &nonce);
+        let s = sample(&proof, &nonce, built.commitment().key_count);
+        let v = verify_byte_response(&s, &nonce, &peer, |k| {
+            let mut garbage = blake3::hash(k).as_bytes().to_vec();
+            garbage.extend_from_slice(b"adversary-fake-storage");
+            Some(Some(garbage))
+        });
+        assert_eq!(v, AuditVerdict::Fail(AuditFailureReason::DigestMismatch));
+    }
+
+    #[test]
+    fn correct_content_address_but_stale_freshness_fails() {
+        // Suppose a responder could serve bytes that hash to the content address
+        // (it holds the chunk) — then BOTH checks pass; that is honest. But if
+        // it serves bytes whose freshness hash does not match (e.g. replaying a
+        // different nonce's digest is impossible since we recompute it here), the
+        // freshness check must catch any content that doesn't reproduce the
+        // committed `nonced_hash`. We model a leaf whose committed nonced_hash was
+        // built under a DIFFERENT nonce, so the audit nonce's recompute differs.
+        let nonce = [9u8; 32];
+        let (built, mut proof, peer) = honest(400, &nonce);
+        // Rewrite the first leaf's nonced_hash to one bound to a different nonce
+        // but keep its bytes_hash correct (so structure for THAT leaf's content
+        // address is fine; only freshness is wrong).
+        let other_nonce = [0xEEu8; 32];
+        let s_keys: Vec<XorName> = sample(&proof, &nonce, built.commitment().key_count)
+            .iter()
+            .map(|l| l.key)
+            .collect();
+        let victim = s_keys.first().copied().unwrap();
+        for leaf in &mut proof.leaves {
+            if leaf.key == victim {
+                leaf.nonced_hash =
+                    nonced_leaf_hash(&other_nonce, &peer, &leaf.key, &chunk_bytes(&leaf.key));
             }
         }
+        // Re-sample against the (now tampered) proof; serve honest content.
+        let s = sample(&proof, &nonce, built.commitment().key_count);
+        let v = verify_byte_response(&s, &nonce, &peer, served_honest);
+        assert_eq!(v, AuditVerdict::Fail(AuditFailureReason::DigestMismatch));
+    }
 
-        assert_eq!(confirmed, vec![k2], "Only K2 should be in confirmed set");
+    #[test]
+    fn auditor_holds_nothing_still_catches_deleter() {
+        // Explicit contract: the auditor's own storage is irrelevant. A deleter
+        // is caught purely from its served (absent) response. (Compare the OLD
+        // design, where an auditor holding none of the chunks went Inconclusive
+        // and the deleter walked free.)
+        let nonce = [0x21u8; 32];
+        let (built, proof, peer) = honest(256, &nonce);
+        assert!(structure(&built, &proof, &nonce, &peer).is_ok());
+        let s = sample(&proof, &nonce, built.commitment().key_count);
+        // Responder is a total deleter: Absent for everything.
+        let v = verify_byte_response(&s, &nonce, &peer, |_| Some(None));
+        assert_eq!(v, AuditVerdict::Fail(AuditFailureReason::DigestMismatch));
+    }
 
-        // Step 3: Construct evidence for confirmed failures only.
-        let challenged_peer = PeerId::from_bytes(peer_id);
-        let evidence = FailureEvidence::AuditFailure {
-            challenge_id: 5300,
-            challenged_peer,
-            confirmed_failed_keys: confirmed,
-            reason: AuditFailureReason::DigestMismatch,
+    #[test]
+    fn sample_size_is_in_3_to_5_band() {
+        // ADR-0002: round-2 samples a SMALL surprise set (3..=5) of the proven
+        // leaves. For a large subtree the sample is capped at 5.
+        let nonce = [7u8; 32];
+        let (built, proof, _peer) = honest(1024, &nonce);
+        let s = sample(&proof, &nonce, built.commitment().key_count);
+        assert!(
+            (BYTE_SPOTCHECK_MIN as usize..=BYTE_SPOTCHECK_MAX as usize).contains(&s.len()),
+            "sample {} must be within 3..=5",
+            s.len()
+        );
+    }
+
+    #[test]
+    fn full_pass_requires_every_sampled_leaf() {
+        // checked must equal the number of sampled leaves on a pass (no leaf is
+        // silently skipped — every sampled, committed key must verify).
+        let nonce = [11u8; 32];
+        let (built, proof, peer) = honest(400, &nonce);
+        let s = sample(&proof, &nonce, built.commitment().key_count);
+        match verify_byte_response(&s, &nonce, &peer, served_honest) {
+            AuditVerdict::Pass { checked } => assert_eq!(checked, s.len()),
+            other => panic!("expected Pass, got {other:?}"),
+        }
+    }
+
+    // ---- end-to-end gate composition ----------------------------------------
+
+    #[test]
+    fn structure_fail_short_circuits_before_round_2() {
+        // A structurally invalid proof is rejected in round 1; the byte challenge
+        // is never issued. We assert the round-1 gate returns Err so the auditor
+        // (verify_subtree_response) never reaches request_byte_proof.
+        let nonce = [5u8; 32];
+        let (built, mut proof, peer) = honest(300, &nonce);
+        if let Some(first) = proof.leaves.first_mut() {
+            first.bytes_hash[0] ^= 0x01;
+        }
+        assert!(structure(&built, &proof, &nonce, &peer).is_err());
+    }
+
+    /// Build an honest committed tree whose keys are deliberately "FAR": their
+    /// addresses live at the high end of the XOR space (top bytes = 0xFF). On the
+    /// auditor side these are the leaves `observe_closeness` counts toward `far`.
+    fn honest_far(n: u32, nonce: &[u8; 32]) -> (BuiltCommitment, SubtreeProof, [u8; 32]) {
+        let (pk, sk) = ml_dsa_65().generate_keypair().unwrap();
+        let peer_id = *blake3::hash(&pk.to_bytes()).as_bytes();
+        let pk_b = pk.to_bytes();
+        let entries: Vec<_> = (0..n)
+            .map(|i| {
+                let mut k = [0xFFu8; 32];
+                k[28..].copy_from_slice(&i.to_be_bytes());
+                (k, *blake3::hash(&chunk_bytes(&k)).as_bytes())
+            })
+            .collect();
+        let built = BuiltCommitment::build(entries, &peer_id, &sk, &pk_b).unwrap();
+        let proof =
+            build_subtree_proof(built.tree(), nonce, &peer_id, |k| Some(chunk_bytes(k))).unwrap();
+        (built, proof, peer_id)
+    }
+
+    /// ADR-0002 "Closeness" is OBSERVE-ONLY: far-keyed honest proofs verify
+    /// exactly like near-keyed ones. The verdict (structure + served bytes) is
+    /// closeness-blind, so a "far/padding" shape can never produce a Fail.
+    #[test]
+    fn closeness_is_observe_only_far_keys_still_pass() {
+        let nonce = [9u8; 32];
+
+        let (built_far, proof_far, peer_far) = honest_far(400, &nonce);
+        assert!(structure(&built_far, &proof_far, &nonce, &peer_far).is_ok());
+        let sf = sample(&proof_far, &nonce, built_far.commitment().key_count);
+        let v_far = verify_byte_response(&sf, &nonce, &peer_far, served_honest);
+
+        let (built_near, proof_near, peer_near) = honest(400, &nonce);
+        assert!(structure(&built_near, &proof_near, &nonce, &peer_near).is_ok());
+        let sn = sample(&proof_near, &nonce, built_near.commitment().key_count);
+        let v_near = verify_byte_response(&sn, &nonce, &peer_near, served_honest);
+
+        match (&v_far, &v_near) {
+            (AuditVerdict::Pass { checked: cf }, AuditVerdict::Pass { checked: cn }) => {
+                assert!(*cf >= 1 && *cn >= 1);
+            }
+            other => panic!("both honest proofs must Pass regardless of closeness, got {other:?}"),
+        }
+        assert!(
+            !matches!(v_far, AuditVerdict::Fail(_)),
+            "far/padding-shaped honest proof must NEVER fail, got {v_far:?}"
+        );
+    }
+
+    // Unused-leaf constructor guard: keep SubtreeLeaf import meaningful.
+    #[test]
+    fn subtree_leaf_is_constructible() {
+        let _l = SubtreeLeaf {
+            key: key(1),
+            bytes_hash: [0u8; 32],
+            nonced_hash: [0u8; 32],
         };
-
-        match evidence {
-            FailureEvidence::AuditFailure {
-                confirmed_failed_keys,
-                ..
-            } => {
-                assert_eq!(
-                    confirmed_failed_keys.len(),
-                    1,
-                    "Only K2 should generate evidence"
-                );
-                assert_eq!(confirmed_failed_keys[0], k2);
-            }
-            _ => panic!("Expected AuditFailure evidence"),
-        }
     }
 }

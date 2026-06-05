@@ -389,12 +389,15 @@ async fn test_audit_challenge_returns_correct_digest() {
     let nonce = [0x42u8; 32];
 
     // Send audit challenge from B to A
+    // Prune-confirmation single-key audit: the on-wire `AuditChallenge` is now
+    // handled by `handle_prune_audit_challenge`, which still answers with
+    // per-key `Digests`. (The storage audit moved to the separate
+    // `SubtreeAuditChallenge`/`SubtreeAuditResponse` path.)
     let challenge = AuditChallenge {
         challenge_id: 1234,
         nonce,
         challenged_peer_id: *peer_a.as_bytes(),
         keys: vec![address],
-        expected_commitment_hash: None,
     };
     let msg = ReplicationMessage {
         request_id: 1234,
@@ -445,7 +448,6 @@ async fn test_audit_absent_key_returns_sentinel() {
         nonce,
         challenged_peer_id: *peer_a.as_bytes(),
         keys: vec![missing_key],
-        expected_commitment_hash: None,
     };
     let msg = ReplicationMessage {
         request_id: 5678,
@@ -869,7 +871,6 @@ async fn test_audit_challenge_multi_key() {
         nonce,
         challenged_peer_id: *peer_a.as_bytes(),
         keys: vec![a1, absent_key, a2],
-        expected_commitment_hash: None,
     };
     let msg = ReplicationMessage {
         request_id: 3000,
