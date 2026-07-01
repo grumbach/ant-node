@@ -1124,7 +1124,7 @@ impl PaymentVerifier {
     /// verification so unauthenticated senders cannot poison the rollout
     /// logs.
     fn validate_quote_arithmetic(payment: &ProofOfPayment) -> Result<()> {
-        if !crate::replication::config::QUOTE_ARITHMETIC_RECHECK_ENABLED {
+        if !crate::replication::config::quote_arithmetic_recheck_enabled() {
             return Ok(());
         }
         for (encoded_peer_id, quote) in &payment.peer_quotes {
@@ -1548,7 +1548,7 @@ impl PaymentVerifier {
         else {
             return; // only this variant is handled here
         };
-        let enforce = crate::replication::config::QUOTE_COMMITMENT_MISMATCH_TRUST_ENABLED;
+        let enforce = crate::replication::config::quote_commitment_mismatch_trust_enabled();
         if enforce {
             warn!(
                 "ADR-0004 quote/commitment mismatch (enforcing) for {peer}: quote claims \
@@ -1629,7 +1629,7 @@ impl PaymentVerifier {
     /// errors. MUST be called only after ML-DSA-65 signature verification has
     /// passed, so unauthenticated peers cannot drive log volume.
     fn log_off_curve_single_node(payment: &ProofOfPayment) {
-        if crate::replication::config::QUOTE_ARITHMETIC_RECHECK_ENABLED {
+        if crate::replication::config::quote_arithmetic_recheck_enabled() {
             return; // enforce mode already rejected; no separate telemetry.
         }
         for (encoded_peer_id, quote) in &payment.peer_quotes {
@@ -1649,7 +1649,7 @@ impl PaymentVerifier {
     fn validate_merkle_candidate_arithmetic(
         pool: &evmlib::merkle_payments::MerklePaymentCandidatePool,
     ) -> Result<()> {
-        if !crate::replication::config::QUOTE_ARITHMETIC_RECHECK_ENABLED {
+        if !crate::replication::config::quote_arithmetic_recheck_enabled() {
             return Ok(());
         }
         for candidate in &pool.candidate_nodes {
@@ -1671,7 +1671,7 @@ impl PaymentVerifier {
     /// errors. MUST be called only after ML-DSA-65 signature verification has
     /// passed.
     fn log_off_curve_merkle(pool: &evmlib::merkle_payments::MerklePaymentCandidatePool) {
-        if crate::replication::config::QUOTE_ARITHMETIC_RECHECK_ENABLED {
+        if crate::replication::config::quote_arithmetic_recheck_enabled() {
             return; // enforce mode already rejected; no separate telemetry.
         }
         for candidate in &pool.candidate_nodes {
@@ -4967,7 +4967,7 @@ mod tests {
         // (which is the default at slice ship). If a future change flips the
         // const, the assertion documents the regression instead of silently
         // changing semantics.
-        if !crate::replication::config::QUOTE_ARITHMETIC_RECHECK_ENABLED {
+        if !crate::replication::config::quote_arithmetic_recheck_enabled() {
             assert!(
                 PaymentVerifier::validate_quote_arithmetic(&payment).is_ok(),
                 "observe-only rollout must not reject off-curve quotes"

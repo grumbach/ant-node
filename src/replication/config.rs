@@ -347,6 +347,44 @@ pub const QUOTE_ARITHMETIC_RECHECK_ENABLED: bool = false;
 /// off-curve price, so it deserves its own dial.
 pub const QUOTE_COMMITMENT_MISMATCH_TRUST_ENABLED: bool = false;
 
+/// EXPERIMENT (testnet only): runtime override for the arithmetic recheck gate.
+///
+/// Reads `ANT_QUOTE_ARITHMETIC_RECHECK` (`1`/`true`/`on`/`yes` to enforce),
+/// defaulting to the compile-time `QUOTE_ARITHMETIC_RECHECK_ENABLED`. Lets the
+/// testnet flip observe→enforce live without recompiling; production (env unset)
+/// keeps the const default.
+#[must_use]
+pub fn quote_arithmetic_recheck_enabled() -> bool {
+    experiment_gate(
+        "ANT_QUOTE_ARITHMETIC_RECHECK",
+        QUOTE_ARITHMETIC_RECHECK_ENABLED,
+    )
+}
+
+/// EXPERIMENT (testnet only): runtime override for the mismatch trust gate.
+///
+/// Reads `ANT_QUOTE_COMMITMENT_MISMATCH_TRUST`, defaulting to the compile-time
+/// `QUOTE_COMMITMENT_MISMATCH_TRUST_ENABLED`.
+#[must_use]
+pub fn quote_commitment_mismatch_trust_enabled() -> bool {
+    experiment_gate(
+        "ANT_QUOTE_COMMITMENT_MISMATCH_TRUST",
+        QUOTE_COMMITMENT_MISMATCH_TRUST_ENABLED,
+    )
+}
+
+/// Read a boolean rollout gate from environment `var`, falling back to `default`
+/// when unset. Accepts `1`, `true`, `on`, `yes` (case-insensitive) as true; any
+/// other value is false.
+fn experiment_gate(var: &str, default: bool) -> bool {
+    std::env::var(var).map_or(default, |v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
+}
+
 /// ADR-0004: max unresolved quote pins to fetch per payment bundle.
 ///
 /// A bundle has at most `CLOSE_GROUP_SIZE` quotes; capping fetches per bundle

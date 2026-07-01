@@ -21,6 +21,44 @@ use saorsa_pqc::pqc::MlDsaOperations;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use evmlib::common::Amount;
+
+/// EXPERIMENT (testnet only): adversarial quote-gaming transform, applied to
+/// generated quotes when the `ANT_ADVERSARY` env var is set. Lets a subset of
+/// nodes be launched with a gaming strategy so ADR-0004 detection/enforcement
+/// can be validated at scale. Honest nodes (env unset) are unaffected. This is
+/// gated behavior for the testnet-experiment branch — NOT for production.
+///
+/// The transform runs BEFORE signing, so the malicious values are genuinely
+/// same-key-signed — exactly the evidence the defenses must catch:
+/// - `off_curve`: sign a price that is NOT on the public pricing curve
+///   (`calculate_price(count + 5) + 1` — a real overcharge the arithmetic
+///   recheck must reject). Commitment fields stay honest.
+/// - `count_pin_mismatch`: inflate the signed `committed_key_count` (priced
+///   on-curve for the lie) while keeping the REAL `commitment_pin`, so the
+///   signed count contradicts the pinned commitment's true count — the
+///   two-artifacts-signed-by-one-key contradiction the mismatch cross-check
+///   must catch.
+fn apply_adversary(
+    committed_key_count: u32,
+    commitment_pin: Option<[u8; 32]>,
+    price: Amount,
+    price_count: usize,
+) -> (u32, Option<[u8; 32]>, Amount) {
+    match std::env::var("ANT_ADVERSARY").ok().as_deref() {
+        Some("off_curve") => (
+            committed_key_count,
+            commitment_pin,
+            calculate_price(price_count.saturating_add(5)).saturating_add(Amount::from(1u128)),
+        ),
+        Some("count_pin_mismatch") => {
+            let lied = committed_key_count.saturating_add(100);
+            (lied, commitment_pin, calculate_price(lied as usize))
+        }
+        _ => (committed_key_count, commitment_pin, price),
+    }
+}
+
 /// Content address type (32-byte `XorName`).
 pub type XorName = [u8; 32];
 
@@ -258,6 +296,11 @@ impl QuoteGenerator {
         // forgeable shape).
         let (committed_key_count, commitment_pin, price_count) = self.resolve_quote_pricing();
         let price = calculate_price(price_count);
+        // EXPERIMENT: adversarial quote-gaming transform (no-op unless
+        // `ANT_ADVERSARY` is set); applied before signing so the malicious
+        // fields are genuinely same-key-signed.
+        let (committed_key_count, commitment_pin, price) =
+            apply_adversary(committed_key_count, commitment_pin, price, price_count);
 
         // Convert XorName to xor_name::XorName
         let xor_name = xor_name::XorName(content);
@@ -357,6 +400,11 @@ impl QuoteGenerator {
         // baseline with no pin.
         let (committed_key_count, commitment_pin, price_count) = self.resolve_quote_pricing();
         let price = calculate_price(price_count);
+        // EXPERIMENT: adversarial quote-gaming transform (no-op unless
+        // `ANT_ADVERSARY` is set); applied before signing so the malicious
+        // fields are genuinely same-key-signed.
+        let (committed_key_count, commitment_pin, price) =
+            apply_adversary(committed_key_count, commitment_pin, price, price_count);
 
         // ADR-0004: sign the commitment binding into the merkle candidate
         // payload too (5-field `bytes_to_sign`), so a count/pin mismatch is
