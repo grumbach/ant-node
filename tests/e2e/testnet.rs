@@ -19,6 +19,7 @@ use ant_node::ant_protocol::{
     MAX_WIRE_MESSAGE_SIZE,
 };
 use ant_node::client::{send_and_await_chunk_response, DataChunk, XorName};
+use ant_node::node::ProtocolEvents;
 use ant_node::payment::{
     EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
     QuotingMetricsTracker,
@@ -1261,12 +1262,13 @@ impl TestNetwork {
             // Wire P2P into AntProtocol for payment-proof closeness checks.
             protocol.attach_p2p_node(Arc::clone(p2p));
 
-            let mut events = p2p.subscribe_events();
+            let mut events =
+                ProtocolEvents::new(p2p.subscribe_events(), format!("node {}", node.index));
             let p2p_clone = Arc::clone(p2p);
             let protocol_clone = Arc::clone(protocol);
             let node_index = node.index;
             node.protocol_task = Some(tokio::spawn(async move {
-                while let Ok(event) = events.recv().await {
+                while let Some(event) = events.recv().await {
                     if let P2PEvent::Message {
                         topic,
                         source: Some(source),
