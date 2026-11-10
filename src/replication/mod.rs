@@ -2155,9 +2155,11 @@ impl ReplicationEngine {
     }
 
     /// Test-only: isolate a monetized first audit of `peer` from live gossip
-    /// audits. Suppresses new gossip lottery attempts for the current cooldown
-    /// window and clears any shared cooldown stamped by an earlier gossip
-    /// launch. The locks follow the production gossip-audit lock order.
+    /// audits. Suppresses this node's new gossip lottery attempts for the
+    /// current cooldown window and clears any shared cooldown stamped by an
+    /// earlier gossip launch. Other nodes can still gossip-audit `peer`; a
+    /// test that needs none to reach it calls this on every node. The locks
+    /// follow the production gossip-audit lock order.
     #[cfg(any(test, feature = "test-utils"))]
     pub async fn isolate_first_audit_for_test(&self, peer: &PeerId) {
         let now = Instant::now();
@@ -2165,6 +2167,17 @@ impl ReplicationEngine {
         let mut launched = self.audit_on_gossip_cooldown.write().await;
         lottery_attempts.insert(*peer, now);
         launched.remove(peer);
+    }
+
+    /// Test-only: whether this node would launch a gossip-triggered audit of
+    /// `peer` now if its lottery ticket won. Runs the production launch
+    /// decision on copies of the attempt window and the shared cooldown, so
+    /// it stamps nothing and leaves the lottery out.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn gossip_audit_could_launch_for_test(&self, peer: &PeerId) -> bool {
+        let mut attempts = self.gossip_lottery_attempts.read().await.clone();
+        let mut launched = self.audit_on_gossip_cooldown.read().await.clone();
+        audit_launch_decision(&mut attempts, &mut launched, peer, Instant::now(), true)
     }
 
     /// Test-only: run ONE subtree audit against `peer` right now, pinned to the

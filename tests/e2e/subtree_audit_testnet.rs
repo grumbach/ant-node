@@ -21,6 +21,7 @@ use super::TestHarness;
 use ant_node::replication::audit::AuditTickResult;
 use ant_node::replication::{FirstAuditStats, MonetizedPinEvent, ReplicationEngine};
 use ant_node::storage::chunk_store::CHUNKS_DIR_NAME;
+use saorsa_core::identity::PeerId;
 use serial_test::serial;
 use tokio::time::sleep;
 
@@ -52,6 +53,14 @@ async fn wait_for_first_audit_stats(
 /// propagation is covered by the dedicated neighbor-sync tests). After this,
 /// `b.audit_peer_now(a)` pins `a`'s real commitment and runs the audit over the
 /// live wire against `a`'s real responder.
+///
+/// Before any of that, every node is barred from launching a gossip-triggered
+/// audit of `a`. The harness runs live commitment gossip, so once `a` commits,
+/// any node that syncs with it may win a gossip audit of it, and `a` serves at
+/// most one round-1 proof per auditor and two in all at a time, leaving any
+/// challenge past those limits unanswered. An audit the test sends while a
+/// gossip audit of `a` is being served could then come back as a timeout. `a`
+/// holds no commitment yet, so no gossip audit of it can already be in flight.
 async fn commit_and_seed(
     harness: &TestHarness,
     a_idx: usize,
@@ -62,6 +71,15 @@ async fn commit_and_seed(
     let b = harness.test_node(b_idx).expect("node b");
     let a_store = a.ant_protocol.as_ref().expect("a protocol").storage();
     let b_store = b.ant_protocol.as_ref().expect("b protocol").storage();
+    let a_engine = a.replication_engine.as_ref().expect("a engine");
+    let a_peer = *a.p2p_node.as_ref().expect("a p2p").peer_id();
+
+    assert!(
+        a_engine.commitment_state().current().is_none(),
+        "a must hold no commitment yet, so no gossip audit of it can be in flight"
+    );
+    isolate_holder_from_gossip_audits(harness, &a_peer).await;
+    assert_no_node_can_gossip_audit(harness, &a_peer).await;
 
     // Store identical chunks on A and B. Content-addressed: addr == BLAKE3(bytes).
     let mut addrs = Vec::with_capacity(n);
@@ -74,7 +92,6 @@ async fn commit_and_seed(
     }
 
     // A commits to its current key set.
-    let a_engine = a.replication_engine.as_ref().expect("a engine");
     a_engine
         .rebuild_commitment_now()
         .await
@@ -82,7 +99,6 @@ async fn commit_and_seed(
 
     // Grab A's freshly built commitment and seed it into B's cache so B can pin
     // it (deterministic; no gossip-timing flake).
-    let a_peer = *a.p2p_node.as_ref().expect("a p2p").peer_id();
     let a_commitment = a_engine
         .commitment_state()
         .current()
@@ -94,6 +110,27 @@ async fn commit_and_seed(
         .inject_peer_commitment_for_test(&a_peer, a_commitment)
         .await;
     addrs
+}
+
+/// Bar every node in `harness` from launching a gossip-triggered audit of
+/// `holder` for the gossip cooldown window.
+async fn isolate_holder_from_gossip_audits(harness: &TestHarness, holder: &PeerId) {
+    for node in harness.network().nodes() {
+        let engine = node.replication_engine.as_ref().expect("engine");
+        engine.isolate_first_audit_for_test(holder).await;
+    }
+}
+
+/// Panic unless no node in `harness` could launch a gossip-triggered audit of
+/// `holder` now, even on a winning lottery ticket.
+async fn assert_no_node_can_gossip_audit(harness: &TestHarness, holder: &PeerId) {
+    for (idx, node) in harness.network().nodes().iter().enumerate() {
+        let engine = node.replication_engine.as_ref().expect("engine");
+        assert!(
+            !engine.gossip_audit_could_launch_for_test(holder).await,
+            "node {idx} could still launch a gossip audit of {holder}"
+        );
+    }
 }
 
 /// HONEST: a node holding its committed data passes the subtree audit.
@@ -319,6 +356,9 @@ async fn first_audit_drainer_launches_and_passes_remote_monetized_pin() {
     let harness = TestHarness::setup_small().await.expect("setup");
     harness.warmup_dht().await.expect("warmup");
 
+    // `commit_and_seed` bars every node from gossip-auditing `a` before `a`
+    // commits, so the first audit, sent after its launch jitter, never meets a
+    // gossip audit at `a`'s round-1 pool.
     let (a_idx, b_idx) = (1, 2);
     commit_and_seed(&harness, a_idx, b_idx, 64).await;
 
@@ -339,11 +379,6 @@ async fn first_audit_drainer_launches_and_passes_remote_monetized_pin() {
         .replication_engine
         .as_ref()
         .expect("b engine");
-
-    // The harness also runs live commitment gossip, whose probabilistic audit
-    // shares the first-audit cooldown. Isolate this assertion from a gossip
-    // launch that may have won that cooldown during setup.
-    b_engine.isolate_first_audit_for_test(&a_peer).await;
 
     b_engine
         .monetized_pin_sender()
