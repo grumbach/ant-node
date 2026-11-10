@@ -81,6 +81,9 @@ the client rollout and document that node admission cannot refund that payment.
 Tests cover common headers, truncation, near-matches, weak crate classifications,
 native/typed PUT parity, unpaid and cached-paid rejection, duplicate rejection,
 existing reads, browser error redaction, and a real self-encrypted upload round trip.
+Live replication regressions seed existing PNG/gzip/XML/SQLite/XZ bytes,
+check that an identical client PUT is rejected, and verify byte-for-byte storage
+through both fresh offers and the repair fetch worker over real QUIC.
 Keep strict Clippy, formatting, and no-default-feature compilation passing.
 Review signatures and repeat the bounded-runtime check when upgrading the classifier.
 
