@@ -88,6 +88,13 @@ pub(super) fn sanitize_response(message: &mut ChunkMessage) -> ServerResult<()> 
 }
 
 fn sanitize_protocol_error(error: &mut ProtocolError) {
+    // This fixed admission error contains no backend details and tells the
+    // browser client how to correct its upload.
+    if matches!(error, ProtocolError::StorageFailed(detail)
+        if detail == crate::storage::upload_validation::FILE_HEADER_REJECTION)
+    {
+        return;
+    }
     let (detail, replacement) = match error {
         ProtocolError::SerializationFailed(detail) => (detail, "message encoding failed"),
         ProtocolError::DeserializationFailed(detail) => (detail, "invalid message encoding"),
@@ -116,6 +123,21 @@ mod tests {
     use super::*;
 
     const PRIVATE_DETAIL: &str = "backend /private/node/chunks.mdb https://rpc.example/key-secret";
+
+    #[test]
+    fn file_header_rejection_remains_actionable_after_sanitization() {
+        let original = ChunkMessage {
+            request_id: 42,
+            body: ChunkMessageBody::PutResponse(ChunkPutResponse::Error(
+                ProtocolError::StorageFailed(
+                    crate::storage::upload_validation::FILE_HEADER_REJECTION.to_string(),
+                ),
+            )),
+        };
+        let wire = original.encode().expect("encode");
+        let decoded = decode_response(wire.clone().into()).expect("sanitize");
+        assert_eq!(decoded.encode().expect("re-encode"), wire);
+    }
 
     #[test]
     fn binary_errors_keep_their_kinds_without_backenddetails() {

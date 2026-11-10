@@ -45,6 +45,7 @@ use crate::replication::admission;
 use crate::replication::config::K_BUCKET_SIZE;
 use crate::replication::fresh::FreshWriteEvent;
 use crate::storage::traffic::{self, ChunkRequestKind, ChunkResponseKey};
+use crate::storage::upload_validation::{has_file_header, FILE_HEADER_REJECTION};
 use crate::storage::ChunkStore;
 use ant_protocol::chunk::{PointerGetResponse, PointerPutResponse};
 use bytes::Bytes;
@@ -835,6 +836,14 @@ impl AntProtocol {
             }
         }
 
+        // Reject obvious unencrypted files before storage or payment work, even
+        // for duplicate PUTs. Replication and reads do not use this upload gate.
+        if has_file_header(&request.content) {
+            return ChunkPutResponse::Error(ProtocolError::StorageFailed(
+                FILE_HEADER_REJECTION.to_string(),
+            ));
+        }
+
         // 3. Check if already exists (idempotent success)
         //
         // Verified against the offered bytes, not answered from the name. A name can
@@ -1416,6 +1425,144 @@ mod tests {
 
         let protocol = AntProtocol::new(storage, payment_verifier, Arc::new(quote_generator));
         (protocol, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn file_header_uploads_are_rejected_before_payment_and_storage() {
+        let (mut protocol, _temp) = create_test_protocol().await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        protocol.set_fresh_write_sender(tx);
+        let records_before = protocol.priced_records_stored();
+
+        let ustar = tar::Header::new_ustar();
+        let gnu_tar = tar::Header::new_gnu();
+        let mut exe = vec![0; 0x98];
+        exe[..2].copy_from_slice(b"MZ");
+        exe[0x3c..0x40].copy_from_slice(&0x80_u32.to_le_bytes());
+        exe[0x80..0x84].copy_from_slice(b"PE\x00\x00");
+        exe[0x96..0x98].copy_from_slice(&0x0002_u16.to_le_bytes());
+        let mut dll = exe.clone();
+        dll[0x96..0x98].copy_from_slice(&0x2002_u16.to_le_bytes());
+        let headers: &[&[u8]] = &[
+            b"\x89PNG\r\n\x1a\n",
+            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00",
+            b"RIFF\x20\x00\x00\x00WAVE",
+            b"ID3\x04\x00\x00\x00\x00\x00\x00",
+            b"\x00\x00\x00\x18ftypisom",
+            b"%PDF-1.7",
+            b"\xef\xbb\xbf\n<!doctype html>",
+            b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff",
+            ustar.as_bytes(),
+            gnu_tar.as_bytes(),
+            b"SQLite format 3\x00",
+            b"\xfd7zXZ\x00",
+            b"\xef\xbb\xbf<?xml version='1.0'?>",
+            b"\x00\x00\x00\x18ftypiso6",
+            b"\x30\x26\xb2\x75\x8e\x66\xcf\x11\xa6\xd9\x00\xaa\x00\x62\xce\x6c",
+            &exe,
+            &dll,
+        ];
+        for header in headers {
+            for paid in [false, true] {
+                let mut content = header.to_vec();
+                content.push(u8::from(paid));
+                content.resize(1024, 0xa5);
+                let content = Bytes::from(content);
+                let address = ChunkStore::compute_address(&content);
+                if paid {
+                    protocol.payment_verifier().cache_insert(address);
+                }
+                let message = ChunkMessage {
+                    request_id: 42,
+                    body: ChunkMessageBody::PutRequest(ChunkPutRequest::new(address, content)),
+                };
+                let wire = message.encode().expect("encode PUT");
+                let typed = protocol
+                    .try_handle_message(message)
+                    .await
+                    .expect("response");
+                let native = protocol
+                    .try_handle_request(&wire)
+                    .await
+                    .expect("handle PUT")
+                    .expect("native response");
+                assert_eq!(typed.encode().expect("encode response"), native.as_ref());
+                assert_eq!(typed.request_id, 42);
+                assert!(matches!(
+                    typed.body,
+                    ChunkMessageBody::PutResponse(ChunkPutResponse::Error(
+                        ProtocolError::StorageFailed(ref message)
+                    )) if message == FILE_HEADER_REJECTION
+                ));
+                assert!(!protocol.exists(&address).expect("exists check"));
+            }
+        }
+        assert_eq!(protocol.priced_records_stored(), records_before);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn file_header_duplicate_put_is_rejected_and_existing_data_remains_readable() {
+        let (protocol, _temp) = create_test_protocol().await;
+        let content = b"\x89PNG\r\n\x1a\nexisting file";
+        let address = ChunkStore::compute_address(content);
+        protocol
+            .put_local(&address, content)
+            .await
+            .expect("seed storage");
+
+        let response = protocol
+            .handle_put_inner(ChunkPutRequest::new(
+                address,
+                Bytes::copy_from_slice(content),
+            ))
+            .await;
+        assert!(matches!(
+            response,
+            ChunkPutResponse::Error(ProtocolError::StorageFailed(ref message))
+                if message == FILE_HEADER_REJECTION
+        ));
+        assert!(matches!(
+            protocol.handle_get_inner(ChunkGetRequest::new(address)).await,
+            ChunkGetResponse::Success { content: stored, .. } if stored == content
+        ));
+    }
+
+    #[cfg(feature = "webrtc-direct")]
+    #[tokio::test]
+    async fn self_encrypted_file_chunks_are_accepted() {
+        let (protocol, _temp) = create_test_protocol().await;
+        let mut file = b"\x89PNG\r\n\x1a\n".to_vec();
+        file.extend((0..4096).map(|index| u8::try_from(index % 256).expect("byte")));
+        let file = Bytes::from(file);
+        let (data_map, chunks) = self_encryption::encrypt(file.clone()).expect("self-encrypt");
+        assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            let address = ChunkStore::compute_address(&chunk.content);
+            protocol.payment_verifier().cache_insert(address);
+            assert!(matches!(
+                protocol
+                    .handle_put_inner(ChunkPutRequest::new(address, chunk.content.clone()))
+                    .await,
+                ChunkPutResponse::Success { .. } | ChunkPutResponse::AlreadyExists { .. }
+            ));
+            assert_eq!(
+                protocol
+                    .storage()
+                    .get(&address)
+                    .await
+                    .expect("read")
+                    .expect("stored"),
+                chunk.content.as_ref()
+            );
+        }
+        assert_eq!(
+            self_encryption::decrypt(&data_map, &chunks).expect("decrypt"),
+            file
+        );
     }
 
     #[tokio::test]
