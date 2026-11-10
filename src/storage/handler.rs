@@ -1530,7 +1530,7 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "webrtc-direct")]
+    #[cfg(all(feature = "webrtc-direct", feature = "test-utils"))]
     #[tokio::test]
     async fn self_encrypted_file_chunks_are_accepted() {
         let (protocol, _temp) = create_test_protocol().await;
