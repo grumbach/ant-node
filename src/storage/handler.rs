@@ -839,9 +839,8 @@ impl AntProtocol {
         // Reject obvious unencrypted files before storage or payment work, even
         // for duplicate PUTs. Replication and reads do not use this upload gate.
         if has_file_header(&request.content) {
-            return ChunkPutResponse::Error(ProtocolError::StorageFailed(
-                FILE_HEADER_REJECTION.to_string(),
-            ));
+            let error = ProtocolError::StorageFailed(FILE_HEADER_REJECTION.into());
+            return ChunkPutResponse::Error(error);
         }
 
         // 3. Check if already exists (idempotent success)
