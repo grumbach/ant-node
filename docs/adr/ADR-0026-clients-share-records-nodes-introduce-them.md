@@ -558,19 +558,42 @@ saorsa-transport's WebRTC Direct already uses).
   read a 300 MiB file (76 records, 16 held) answered `Missing` to about half
   the asks in a slowed testnet run. Records a client already holds when it
   joins a room are told to the room's links as the room learns its file's
-  records, so a link that opened first still hears of them. A client sends at
-  most 4 records at once, and starts no send past 1 while fetches of its own
-  are running (another number from 0 to 4 with
-  `ANT_SWARM_UPLOADS_WHILE_READING` natively, or `setSwarmUploadsWhileReading`
-  in a browser, for experiments), whatever they are for (a file's records or its map, a raw
-  read or an existence check; sends already running when one starts finish; the count
-  is taken in one step, so two links never both take the last place): a
-  record sent costs the sender's CPU and line, which its own download needs
-  first
-  (in the lab, readers each held to one CPU core and sending 4 at once while
-  downloading took up to 40 % longer than nodes alone; sending 1 at a time,
-  they were no slower); a client done reading sends 4,
-  2 per link, one more than a peer asks for at once (a record the peer gave
+  records, so a link that opened first still hears of them. A client sends as
+  many records at once as its upload rate gives each the rate a reader needs,
+  as a BitTorrent client sizes its upload slots by its upload rate: one at
+  first, and one more for each 1 MiB/s its sends have shown they deliver,
+  twice the 512 KiB/s below which a reader gives up on a peer and asks the
+  nodes, so the sends that rate carries each get at least that and the one
+  more tries the line further; up to one a link (16). The rate is what its
+  line carried: the bytes that left all its links' channels (each link counts
+  the bytes it hands its channel, and the channel says what it still holds:
+  in a browser, what it has not passed to the network; natively, what the
+  reader has not acknowledged; a link let go is counted a last time), every
+  100 ms while any send holds a place, with the whole of each tick in which
+  bytes left or a send held a place as time spent sending, in samples of at
+  least 1 s of it: so bytes never count without their time, and records
+  small enough for the channel to buffer whole count no faster than the line
+  took them, though a burst inside a tick counts slower than it went. A send
+  holds its place until its channel holds nothing unsent (natively,
+  acknowledgements can come for later bytes before earlier ones are sent
+  again, so only an empty channel tells that a record has left it whole), or
+  its reader asks that link again, which a reader does only once its last
+  record has come, or until the page is hidden, whose timers are slowed. A channel still not empty 20 s after a send began, with
+  nothing newer asked of its link, ends the link, as a send that stalls
+  does. The best rate seen is kept,
+  fading a fifth for every 4 s spent sending since: readers asking little or
+  reading slowly do not make it forget what its line carried, and a line
+  slowed for good is followed within a minute or so of sending. A link that
+  cannot carry a full rate alone (a far reader, natively, whose channel waits
+  on its acknowledgements) would never show what several carry together:
+  after every 8 s of holding places, a client whose places are all taken has
+  one more for 2 s, and keeps it if the rate shown earns it. The count is
+  taken in one step, so two links never both take the last place, and sends
+  running when the limit falls finish. It starts at one because a record sent costs the
+  sender's CPU and line, which its own download needs too: in the lab,
+  readers each held to one CPU core and sending 4 at once while downloading
+  took up to 40 % longer than nodes alone, and sending 1 at a time they were
+  no slower. A client sends one link at most 2 records at once, one more than a peer asks for at once (a record the peer gave
   up on counts until its next piece sees that, and the peer's next ask may
   come first), and answers `Busy` past that; an ask cancelled and made again under the same id is a new transfer,
   and the old one stops. A record, or any other message,
@@ -610,9 +633,8 @@ saorsa-transport's WebRTC Direct already uses).
   at most 2 offers per announce, each a WebRTC connection with up to 3 s of
   ICE gathering and every negotiation step bounded, and at most 8 links;
   per room, at most 8 answers started in 20 s; per client: 4 rooms, 16
-  links, 8 answers being made, 4 records sent (1 while any of its own fetches
-  runs) and 8
-  received at once. In a browser that makes connections take turns to
+  links, 8 answers being made, records sent as its upload rate allows (1 at
+  first, at most 16, one a link) and 8 received at once. In a browser that makes connections take turns to
   gather ICE (every engine but Chromium), the swarm's own connections take
   the page's turn only while it is free and no connection to a node waits
   for it, and a room's lookup asks one node at a time, dials each only then,
@@ -667,9 +689,9 @@ saorsa-transport's WebRTC Direct already uses).
   publicly has the same root map and records, and its private and public
   readers meet in one room; its nodes could already see them fetch the same
   records.
-- **Clients upload.** A client sends up to 4 records at once to other readers
-  for as long as it is in their room, which costs bandwidth and, on phones,
-  data and battery.
+- **Clients upload.** A client sends other readers as many records at once as
+  its line carries, up to one a link, for as long as it is in their room,
+  which costs bandwidth and, on phones, data and battery.
 - **Browsers poll.** A browser's announce every 1 to 3 s per room and
   rendezvous node is a small request on its control lane; a held announce
   would cost it a request slot instead. Native clients long-poll. A room of
