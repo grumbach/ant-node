@@ -472,7 +472,8 @@ saorsa-transport's WebRTC Direct already uses).
   opened by the peer, a text message, or a message longer than the wire
   allows ends the link before anything is copied.
 - **Sharing.** Over the data channel, peers say which records they hold
-  (`Have`), ask (`Get`), and answer with 16 KiB `Piece`s, `Missing` or `Busy`.
+  (`Have`) and which of those they dropped since (`Gone`), ask (`Get`), and
+  answer with 16 KiB `Piece`s, `Missing` or `Busy`.
   Every message is bounded before anything is allocated for it; every piece
   but a record's last is a full frame; a channel holds at most 257 messages
   unread (a bound of 256 plus the one sender's place) and, unsent, 256 KiB
@@ -551,11 +552,17 @@ saorsa-transport's WebRTC Direct already uses).
 - **Serving.** Records fetched from nodes, or from peers and checked, go into a
   store of 256 MiB (native) or 64 MiB (browser), oldest dropped first, and so
   do records a read finds in the chunk cache, so records read before the
-  room was joined are offered too. Records a client already holds when it
+  room was joined are offered too. A record dropped to make room is taken
+  back (`Gone`) from the links of the rooms whose file holds it, and from no
+  others, so its readers stop asking for it: without this, a browser that
+  read a 300 MiB file (76 records, 16 held) answered `Missing` to about half
+  the asks in a slowed testnet run. Records a client already holds when it
   joins a room are told to the room's links as the room learns its file's
   records, so a link that opened first still hears of them. A client sends at
   most 4 records at once, and starts no send past 1 while fetches of its own
-  are running, whatever they are for (a file's records or its map, a raw
+  are running (another number from 0 to 4 with
+  `ANT_SWARM_UPLOADS_WHILE_READING` natively, or `setSwarmUploadsWhileReading`
+  in a browser, for experiments), whatever they are for (a file's records or its map, a raw
   read or an existence check; sends already running when one starts finish; the count
   is taken in one step, so two links never both take the last place): a
   record sent costs the sender's CPU and line, which its own download needs
