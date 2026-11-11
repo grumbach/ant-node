@@ -10361,6 +10361,7 @@ async fn rebuild_and_rotate_commitment(
     // commitment, and the pruner reclaims it once no retained slot holds it.
     let mut pointer_keys = Vec::new();
     for state in pointers.map(PointerStore::held_states).unwrap_or_default() {
+        consume_budget().await;
         if groups.includes(&state.address, &self_id) {
             pointer_keys.push(state.address);
         }
