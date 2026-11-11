@@ -226,6 +226,9 @@ jobs:
       - name: Unit tests without default features (no logging, no webrtc-direct)
         if: runner.os == 'Linux'
         run: cargo test --lib --no-default-features
+      - name: Upload admission tests with default features (without test-utils)
+        if: runner.os == 'Linux'
+        run: cargo test --locked --lib storage::upload_validation::tests -- --quiet
       # The run-directory tests that mount a tmpfs and bind mounts inside run
       # directories, make directories another user owns, or act as another
       # user. They need root, which the runner gives through sudo, so

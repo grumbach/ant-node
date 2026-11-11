@@ -1090,6 +1090,38 @@ Enable detailed logging:
 RUST_LOG=ant_node=debug,saorsa_core=debug ./ant-node
 ```
 
+### Client chunk upload headers
+
+Clients should self-encrypt files before uploading their chunks. Nodes reject
+client PUTs with recognizable file headers before checking payment or writing
+storage, including duplicate PUTs. This applies to native and browser uploads.
+The node uses `file-format` with all deep reader features disabled, passing
+only the first 265 bytes (enough to include POSIX/GNU tar's signature). A
+curated admission list rejects distinctive signatures for common images,
+audio/video, PDF, Office documents, SQLite, and archives, including XZ. This
+also covers ASF, JPEG 2000, and additional MP4 and iTunes media variants.
+Short signatures such as JPEG, ZIP, and gzip require supporting header bytes;
+unknown, ambiguous, and unvetted crate matches pass this heuristic.
+
+HTML and XML checks inspect only the first 64 bytes. HTML detection allows a
+UTF-8 BOM, leading whitespace, and mixed case for document openers
+(`<!doctype html`, `<html`, `<head`, `<body`). Windows EXE/DLL detection checks
+the `MZ` header and four bytes at the PE signature offset specified by that
+header, with bounds checks and no search. Gzip detection also catches
+`.tar.gz`/`.tgz` uploads.
+There is no file parsing, decompression, or scan of chunk contents. Existing
+stored data remains readable and replication continues unchanged.
+
+This is a lightweight heuristic, not verification of self-encryption. Headerless
+plaintext, unsupported formats, and disguised headers can pass; accidental
+matches with encrypted bytes remain possible. Short magic values require
+supporting header bytes to reduce that risk. Old tar files without the ustar
+signature and HTML without recognized document openers can pass.
+XML detection recognizes ASCII/UTF-8 declarations (`<?xml` followed by XML
+whitespace), allowing a UTF-8 BOM and leading whitespace. XML without a
+declaration or in other encodings can pass. An EXE/DLL whose PE signature lies
+outside the uploaded chunk can also pass.
+
 ---
 
 ## Related Projects

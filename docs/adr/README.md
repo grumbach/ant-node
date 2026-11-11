@@ -20,6 +20,8 @@ See [`TOOLING.md`](./TOOLING.md) for `adrs`, `adr-kit`, and AI harness setup.
 
 ## Index
 
+- [ADR-0030: Reject recognizable file headers on client chunk uploads](./ADR-0030-recognizable-file-headers-on-client-uploads.md)
+
 - [ADR-0001: Adopt Architecture Decision Records](./ADR-0001-adopt-architecture-decision-records.md)
 - [ADR-0002: Gossip-triggered contiguous-subtree storage audit](./ADR-0002-gossip-triggered-contiguous-subtree-audit.md)
 - [ADR-0003: Full-node detection, penalisation, and eviction](./ADR-0003-full-node-detection-and-eviction.md)

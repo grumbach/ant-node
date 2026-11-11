@@ -7,7 +7,9 @@
 
 use super::testnet::{TestNetworkConfig, DEFAULT_CHUNK_OPERATION_TIMEOUT_SECS};
 use super::{TestHarness, NEARLY_FULL_DISK, ROOMY_DISK};
-use ant_node::ant_protocol::{ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse};
+use ant_node::ant_protocol::{
+    ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse, ProtocolError,
+};
 use ant_node::client::compute_address;
 use ant_node::replication::audit_coordinator::AuditChallengeCoordinator;
 use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
@@ -253,6 +255,146 @@ async fn test_fresh_replication_propagates_to_close_group() {
     );
 
     harness.teardown().await.expect("teardown");
+}
+
+/// Existing file bytes remain eligible for node-to-node replication even
+/// though an identical new client PUT is refused by upload admission.
+#[tokio::test]
+#[serial]
+async fn file_headers_are_rejected_on_client_put_but_fresh_replication_still_stores() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+    let source_idx = FRESH_PIPELINE_SOURCE_INDEX;
+    let source = harness.test_node(source_idx).expect("source node");
+    let protocol = source.ant_protocol.as_ref().expect("source protocol");
+    let source_p2p = source.p2p_node.as_ref().expect("source p2p");
+    let target = harness.test_node(4).expect("replication target");
+    let target_peer = *target.p2p_node.as_ref().expect("target p2p").peer_id();
+    let target_storage = target
+        .ant_protocol
+        .as_ref()
+        .expect("target protocol")
+        .storage();
+
+    for content in file_header_replication_fixtures() {
+        let address = compute_address(content);
+        let request = ChunkMessage {
+            request_id: rand::random(),
+            body: ChunkMessageBody::PutRequest(ChunkPutRequest::new(
+                address,
+                Bytes::copy_from_slice(content),
+            )),
+        };
+        let response = protocol
+            .try_handle_request(&request.encode().expect("encode client PUT"))
+            .await
+            .expect("handle client PUT")
+            .expect("client response");
+        assert!(matches!(
+            ChunkMessage::decode(&response).expect("decode client response").body,
+            ChunkMessageBody::PutResponse(ChunkPutResponse::Error(
+                ProtocolError::StorageFailed(message)
+            )) if message == "chunk has a recognizable file header; self-encrypt files before uploading"
+        ));
+        assert!(!protocol.storage().exists(&address).expect("exists"));
+
+        // Seed a previously stored record; this must not emit a client PUT or
+        // silently transform its bytes. Require an explicit fresh acceptance
+        // over the real network, so a background repair cannot mask refusal.
+        store_paid_chunk(&harness, source_idx, content).await;
+        let response = send_replication_request(
+            source_p2p,
+            &target_peer,
+            ReplicationMessage {
+                request_id: rand::random(),
+                body: ReplicationMessageBody::FreshReplicationOffer(FreshReplicationOffer {
+                    key: address,
+                    data: content.to_vec(),
+                    proof_of_payment: dummy_payment_proof(),
+                }),
+            },
+            PROPAGATION_TIMEOUT,
+        )
+        .await;
+        assert!(matches!(
+            response.body,
+            ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Accepted { key })
+                if key == address
+        ));
+        assert_eq!(
+            target_storage
+                .get(&address)
+                .await
+                .expect("read replica")
+                .expect("stored replica"),
+            content,
+            "replication must preserve the original bytes"
+        );
+    }
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// Repair uses the fetch worker, separately from immediate fresh offers.
+/// A recognizable header must not prevent that worker from writing a replica.
+#[tokio::test]
+#[serial]
+async fn file_headers_still_replicate_through_the_repair_fetch_worker() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+    let source = harness
+        .test_node(FRESH_PIPELINE_SOURCE_INDEX)
+        .expect("source node");
+    let source_peer = *source.p2p_node.as_ref().expect("source p2p").peer_id();
+    let target = harness.test_node(4).expect("repair target");
+    let target_storage = target
+        .ant_protocol
+        .as_ref()
+        .expect("target protocol")
+        .storage();
+    let target_engine = target.replication_engine.as_ref().expect("target engine");
+
+    for content in file_header_replication_fixtures() {
+        let address = store_paid_chunk(&harness, FRESH_PIPELINE_SOURCE_INDEX, content).await;
+        assert!(!target_storage
+            .exists(&address)
+            .expect("exists before repair"));
+        // Only bypass queue promotion, as the responsibility-recheck tests
+        // do. Download, content-address validation, and disk write are real.
+        assert!(
+            target_engine
+                .enqueue_fetch_for_test(address, vec![source_peer])
+                .await
+        );
+        assert!(
+            wait_until(
+                || target_storage.exists(&address).unwrap_or(false),
+                PROPAGATION_TIMEOUT
+            )
+            .await,
+            "repair must store recognizable file bytes"
+        );
+        assert_eq!(
+            target_storage
+                .get(&address)
+                .await
+                .expect("read repair")
+                .expect("repaired record"),
+            content
+        );
+    }
+
+    harness.teardown().await.expect("teardown");
+}
+
+fn file_header_replication_fixtures() -> [&'static [u8]; 5] {
+    [
+        b"\x89PNG\r\n\x1a\nexisting image",
+        b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xffexisting archive",
+        b"<?xml version='1.0'?><existing/>",
+        b"SQLite format 3\x00existing database",
+        b"\xfd7zXZ\x00existing archive",
+    ]
 }
 
 /// The whole PUT path: a chunk PUT through the handler emits the fresh-write
