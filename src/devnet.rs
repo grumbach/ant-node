@@ -6,6 +6,7 @@
 use crate::ant_protocol::CHUNK_PROTOCOL_ID;
 use crate::config::{default_root_dir, NODES_SUBDIR, NODE_IDENTITY_FILENAME};
 use crate::logging::{debug, info, warn};
+use crate::node::ProtocolEvents;
 use crate::payment::{
     EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, PriceFloorConfig, QuoteGenerator,
     QuotingMetricsTracker,
@@ -1322,13 +1323,14 @@ impl Devnet {
             // Wire P2P into AntProtocol for payment-proof closeness checks.
             protocol.attach_p2p_node(Arc::clone(p2p));
 
-            let mut events = p2p.subscribe_events();
+            let mut events =
+                ProtocolEvents::new(p2p.subscribe_events(), format!("node {}", node.index));
             let p2p_clone = Arc::clone(p2p);
             let protocol_clone = Arc::clone(protocol);
             let handlers = node.handlers.clone();
             let node_index = node.index;
             node.protocol_task = Some(tokio::spawn(async move {
-                while let Ok(event) = events.recv().await {
+                while let Some(event) = events.recv().await {
                     if let P2PEvent::Message {
                         topic,
                         source: Some(source),

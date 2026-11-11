@@ -211,6 +211,11 @@ static TX_COUNT: [AtomicU64; ChunkResponseKey::N] =
 /// Encoded responses whose transport send failed (not in `TX_*`).
 static SEND_FAILED_BYTES: AtomicU64 = AtomicU64::new(0);
 static SEND_FAILED_COUNT: AtomicU64 = AtomicU64::new(0);
+/// P2P events protocol routing skipped because it fell behind the transport.
+///
+/// Counted across every topic, since a skipped event cannot be read: some were chunk
+/// requests that went unanswered, the rest were traffic routing ignores anyway.
+static ROUTING_LAGGED_EVENTS: AtomicU64 = AtomicU64::new(0);
 
 /// Record one inbound chunk message at decode time (wire length).
 pub fn record_rx(kind: ChunkRequestKind, bytes: usize) {
@@ -232,14 +237,19 @@ pub fn record_send_failed(bytes: usize) {
     SEND_FAILED_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Record P2P events protocol routing skipped because it fell behind.
+pub fn record_routing_lagged(missed: u64) {
+    ROUTING_LAGGED_EVENTS.fetch_add(missed, Ordering::Relaxed);
+}
+
 /// Emit the cumulative chunk-RPC traffic as INFO summary lines, target
 /// `ant_node::storage::traffic`.
 ///
 /// Flat snake-case keys like the replication summary. Four lines sharing the
-/// same target and message, distinguished by `group`: rx by request kind
-/// (`group = 1`), chunk and quote tx by kind × outcome (`group = 2`), pointer
-/// tx by kind × outcome (`group = 3`), and get-or-closer rx and tx
-/// (`group = 4`). Pointers and get-or-closer take lines of their own because
+/// same target and message, distinguished by `group`: rx by request kind, plus
+/// the P2P events routing skipped by falling behind (`group = 1`), chunk and
+/// quote tx by kind × outcome (`group = 2`), pointer tx by kind × outcome
+/// (`group = 3`), and get-or-closer rx and tx (`group = 4`). Pointers and get-or-closer take lines of their own because
 /// `group = 2` is already close to `tracing`'s 32-field cap.
 pub fn log_chunk_rpc_traffic_summary() {
     use ChunkRequestKind as Q;
@@ -264,6 +274,7 @@ pub fn log_chunk_rpc_traffic_summary() {
         pointer_put_rx_bytes = rb(Q::PointerPut), pointer_put_rx_count = rc(Q::PointerPut),
         other_rx_bytes = rb(Q::Other), other_rx_count = rc(Q::Other),
         decode_error_rx_bytes = rb(Q::DecodeError), decode_error_rx_count = rc(Q::DecodeError),
+        routing_lagged_event_count = ROUTING_LAGGED_EVENTS.load(Ordering::Relaxed),
         "chunk rpc traffic summary (cumulative)"
     );
 

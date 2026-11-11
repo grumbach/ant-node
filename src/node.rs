@@ -32,6 +32,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::broadcast;
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -46,6 +48,13 @@ use tokio::signal::unix::{signal, SignalKind};
 /// Short, because these are single request/response exchanges and the peer will retry.
 /// The point is to stop new storage work starting, not to see every last request through.
 const PROTOCOL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often protocol routing may warn that it fell behind.
+///
+/// After a lag the receiver resumes at the oldest event the channel kept, the very slot the
+/// next send overwrites, so under sustained overload it lags again almost at once. Warning on
+/// every lag would log at close to the event rate; the chunk traffic summary has the total.
+const ROUTING_LAG_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The user agent this node announces itself with.
 ///
@@ -1077,14 +1086,17 @@ impl RunningNode {
             None => return,
         };
 
-        let mut events = self.p2p_node.subscribe_events();
+        let mut events = ProtocolEvents::new(
+            self.p2p_node.subscribe_events(),
+            self.p2p_node.peer_id().to_string(),
+        );
         let p2p = Arc::clone(&self.p2p_node);
         let semaphore = Arc::new(Semaphore::new(64));
         let children = self.protocol_children.clone();
         let stopping = self.shutdown.clone();
 
         self.protocol_task = Some(tokio::spawn(async move {
-            while let Ok(event) = events.recv().await {
+            while let Some(event) = events.recv().await {
                 if let P2PEvent::Message {
                     topic,
                     source: Some(source),
@@ -1150,6 +1162,72 @@ impl RunningNode {
     }
 }
 
+/// Protocol routing's view of the P2P event stream.
+///
+/// The receiver lags when routing falls more than the channel's capacity behind the
+/// transport. The events it skipped are gone, and any chunk requests among them go
+/// unanswered, but the receiver itself is still good: it resumes at the oldest event the
+/// channel kept. A loop that stopped there, as `while let Ok(..) = recv()` does, would leave
+/// the node answering no chunk requests until restart, with nothing logged, while it stays
+/// in its peers' routing tables (V2-1448). So a lag is counted and passed over, and logged at
+/// most once per `ROUTING_LAG_WARN_INTERVAL`; only a closed stream ends routing.
+///
+/// Public so test networks that route messages themselves read events the same way.
+pub struct ProtocolEvents {
+    events: broadcast::Receiver<P2PEvent>,
+    /// Names the node in the lag warning, since test networks run many in one process.
+    #[cfg_attr(not(feature = "logging"), allow(dead_code))]
+    reader: String,
+    /// When the lag warning last fired, if it has.
+    last_lag_warning: Option<Instant>,
+    /// Events missed since the lag warning last fired, for the next one to report.
+    missed_since_warning: u64,
+}
+
+impl ProtocolEvents {
+    /// Read `events` for the node that `reader` names in log lines.
+    pub fn new(events: broadcast::Receiver<P2PEvent>, reader: impl Into<String>) -> Self {
+        Self {
+            events,
+            reader: reader.into(),
+            last_lag_warning: None,
+            missed_since_warning: 0,
+        }
+    }
+
+    /// The next P2P event, or `None` once the event stream has closed.
+    pub async fn recv(&mut self) -> Option<P2PEvent> {
+        loop {
+            match self.events.recv().await {
+                Ok(event) => return Some(event),
+                Err(RecvError::Lagged(missed)) => self.record_lag(missed),
+                Err(RecvError::Closed) => return None,
+            }
+        }
+    }
+
+    fn record_lag(&mut self, missed: u64) {
+        storage_traffic::record_routing_lagged(missed);
+        self.missed_since_warning = self.missed_since_warning.saturating_add(missed);
+        let now = Instant::now();
+        let warned_recently = self
+            .last_lag_warning
+            .is_some_and(|warned| now.duration_since(warned) < ROUTING_LAG_WARN_INTERVAL);
+        if warned_recently {
+            return;
+        }
+        warn!(
+            "Protocol routing for {} fell behind and missed {} P2P events; any chunk requests \
+             among them were dropped unanswered (warned at most every {}s)",
+            self.reader,
+            self.missed_since_warning,
+            ROUTING_LAG_WARN_INTERVAL.as_secs()
+        );
+        self.last_lag_warning = Some(now);
+        self.missed_since_warning = 0;
+    }
+}
+
 /// Apply ±5% jitter to a base interval to prevent thundering-herd behaviour
 /// when multiple nodes check for upgrades on the same schedule.
 fn jittered_interval(base: std::time::Duration) -> std::time::Duration {
@@ -1172,6 +1250,32 @@ mod tests {
     /// A well-formed address that receives nothing; no chain is contacted in these tests.
     const TEST_REWARDS_ADDRESS: &str = "0x0000000000000000000000000000000000000001";
 
+    /// Twice saorsa-core's P2P event channel capacity (1,000), so a routing task that is not
+    /// polled while this many events arrive is certain to lag.
+    const EVENT_FLOOD: usize = 2_000;
+
+    /// A topic protocol routing ignores, so the flood itself starts no request handlers.
+    const FLOOD_TOPIC: &str = "/ant-node-test/flood/1";
+
+    /// Turns handed to other tasks after the flood: enough for routing to see its lag.
+    const ROUTING_TURNS: usize = 8;
+
+    /// How long a chunk PUT sent after the lag may take to be stored. Routing first works
+    /// through the events the channel kept, so this is generous, not tight.
+    const HANDLED_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// How often the lag test looks for the chunk in the store.
+    const STORE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+    /// The chunk the lag test sends once routing has fallen behind.
+    const CHUNK_SENT_AFTER_LAG: &[u8] = b"sent after protocol routing lagged";
+
+    /// Names the reader of a hand-built event channel in lag warnings.
+    const TEST_READER: &str = "test reader";
+
+    /// Capacity of the hand-built channel in the lag test; anything past it is skipped.
+    const SMALL_EVENT_CHANNEL_CAPACITY: usize = 2;
+
     /// A node config that builds without touching a chain or a real network.
     ///
     /// Port 0: the OS assigns a free port, so a build never fails on a port that
@@ -1189,6 +1293,170 @@ mod tests {
             },
             ..NodeConfig::default()
         }
+    }
+
+    /// An unsigned message on `topic`, for a hand-built event channel.
+    fn message_on(topic: &str) -> P2PEvent {
+        P2PEvent::Message {
+            topic: topic.to_string(),
+            source: None,
+            transport_source: None,
+            timestamp: 0,
+            data: Vec::new(),
+        }
+    }
+
+    /// Protocol routing keeps handling chunk messages after its event receiver lags
+    /// (V2-1448, Darwin disclosure #4).
+    ///
+    /// It used to stop on the first lag, leaving a node that stayed in its peers' routing
+    /// tables but answered no chunk request until restart, with nothing logged.
+    #[tokio::test]
+    async fn protocol_routing_survives_a_lagged_event_receiver() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("node");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let mut node = NodeBuilder::new(local_node_config(&root))
+            .build()
+            .await
+            .expect("build");
+        node.start_protocol_routing();
+        assert!(node.protocol_task.is_some(), "routing did not start");
+        // Subscribed after routing and never read, so it is at least as far ahead as routing:
+        // if it lags, so has routing.
+        let mut witness = node.p2p_node.subscribe_events();
+
+        // With no peers, `publish` only hands the event to local subscribers and never
+        // suspends, so on this single-threaded runtime routing cannot run until the flood is
+        // over, and is left further behind than the channel holds, as a starved task would
+        // be. `unconstrained` keeps it that way should `publish` ever take an uncontended
+        // tokio lock, whose cooperative budget would otherwise yield to routing part-way.
+        tokio::task::unconstrained(async {
+            for _ in 0..EVENT_FLOOD {
+                node.p2p_node
+                    .publish(FLOOD_TOPIC, &[])
+                    .await
+                    .expect("publish");
+            }
+        })
+        .await;
+        assert!(
+            matches!(
+                witness.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
+            ),
+            "the flood did not overflow the event channel, so this test proves nothing"
+        );
+        for _ in 0..ROUTING_TURNS {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            node.protocol_task
+                .as_ref()
+                .is_some_and(|task| !task.is_finished()),
+            "protocol routing stopped after its event receiver lagged"
+        );
+
+        // A chunk PUT sent after the lag is still handled: the chunk lands in this node's own
+        // store. Marked paid, so no chain is needed, and with no peers this node is the
+        // closest to every address, so it accepts the chunk.
+        let protocol = node
+            .ant_protocol
+            .as_ref()
+            .map(Arc::clone)
+            .expect("protocol");
+        let address = ChunkStore::compute_address(CHUNK_SENT_AFTER_LAG);
+        protocol.payment_verifier().cache_insert(address);
+        let put = crate::ant_protocol::ChunkMessage {
+            request_id: 0,
+            body: crate::ant_protocol::ChunkMessageBody::PutRequest(
+                crate::ant_protocol::ChunkPutRequest::new(
+                    address,
+                    bytes::Bytes::from_static(CHUNK_SENT_AFTER_LAG),
+                ),
+            ),
+        }
+        .encode()
+        .expect("encode");
+        node.p2p_node
+            .publish(CHUNK_PROTOCOL_ID, &put)
+            .await
+            .expect("publish");
+        let stored = tokio::time::timeout(HANDLED_DEADLINE, async {
+            while !protocol.storage().exists(&address).expect("exists") {
+                tokio::time::sleep(STORE_POLL_INTERVAL).await;
+            }
+        })
+        .await;
+        assert!(
+            stored.is_ok(),
+            "a chunk PUT sent after the lag was never handled"
+        );
+
+        node.cleanup().await;
+    }
+
+    /// Routing passes over each lag, resuming at the oldest event the channel kept; it warns
+    /// about lags at most once per interval but counts every one; and it ends only when the
+    /// stream closes.
+    #[tokio::test]
+    async fn protocol_events_pass_over_lags_and_end_on_close() {
+        let capacity = SMALL_EVENT_CHANNEL_CAPACITY;
+        let (sender, receiver) = tokio::sync::broadcast::channel(capacity);
+        let mut events = ProtocolEvents::new(receiver, TEST_READER);
+        let send = |range: std::ops::Range<usize>| {
+            for i in range {
+                sender.send(message_on(&i.to_string())).expect("send");
+            }
+        };
+        let topic = |event: Option<P2PEvent>| match event {
+            Some(P2PEvent::Message { topic, .. }) => Some(topic),
+            _ => None,
+        };
+
+        // Twice the capacity before anything is read: the first `capacity` are overwritten.
+        send(0..2 * capacity);
+        assert_eq!(
+            topic(events.recv().await),
+            Some(capacity.to_string()),
+            "routing did not resume at the oldest event kept"
+        );
+        assert!(
+            events.last_lag_warning.is_some(),
+            "the first lag was not warned about"
+        );
+        assert_eq!(events.missed_since_warning, 0);
+        let warned_at = events.last_lag_warning;
+
+        // Overflow again at once. Reading resumed one past `capacity`, and the oldest kept is
+        // now `2 * capacity + 1`, so `capacity` more are skipped: counted, but not warned
+        // about, being well inside the warning interval.
+        send(2 * capacity..3 * capacity + 1);
+        assert_eq!(
+            topic(events.recv().await),
+            Some((2 * capacity + 1).to_string()),
+            "routing did not resume at the oldest event kept after a second lag"
+        );
+        assert_eq!(
+            events.missed_since_warning, capacity as u64,
+            "the second lag was not counted"
+        );
+        assert_eq!(
+            events.last_lag_warning, warned_at,
+            "the second lag was warned about inside the interval"
+        );
+
+        drop(sender);
+        let mut rest = Vec::new();
+        while let Some(event) = events.recv().await {
+            if let P2PEvent::Message { topic, .. } = event {
+                rest.push(topic);
+            }
+        }
+        let expected = (2 * capacity + 2..=3 * capacity)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(rest, expected, "events were lost without a lag");
     }
 
     /// A browser listener that cannot bind fails startup, and `run` still drains what it
