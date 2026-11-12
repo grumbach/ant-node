@@ -283,7 +283,12 @@ may only be appended.
 - **Replies.** A reply to a native client whose connection closed meanwhile,
   or from a node stopping, is dropped rather than sent, and a reply goes
   only on a connection the client still has, so the node never dials a
-  client that left. A signed message is not bound to the connection it came
+  client that left. A reply the transport has not taken within 2 s is
+  abandoned, as is one still being handed over when the node starts
+  stopping: the transport's write timeout starts again after each partial
+  write, so a native client granting its stream credit a few bytes at a
+  time could otherwise keep a swarm task, and enough of them every task (a
+  fetch's busy reply is bounded the same way, ADR-0025). A signed message is not bound to the connection it came
   on, and saorsa-core maps a client's identity to every connection a message
   signed by it arrived on: a node that saw a client's message could send it
   on to another node, which would then take the sender's connection for the

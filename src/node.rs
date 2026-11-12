@@ -30,8 +30,10 @@ use saorsa_core::{
     P2PNode,
 };
 use saorsa_transport::shared::normalize_socket_addr;
+use std::future::Future;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -40,6 +42,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -255,15 +258,62 @@ impl NativeSwarmRouter {
             // another of the client's connections, nor dials a client that
             // left between the check above and the send.
             Ok(bytes) => {
-                if let Err(e) = p2p
-                    .send_message_on_channel(source, &channel, CHUNK_PROTOCOL_ID, bytes)
-                    .await
-                {
-                    debug!("Failed to send swarm reply to {source}: {e}");
+                let send = p2p.send_message_on_channel(source, &channel, CHUNK_PROTOCOL_ID, bytes);
+                match send_within(send, stopping, SWARM_REPLY_SEND_TIMEOUT).await {
+                    ReplySend::Sent | ReplySend::Stopped => {}
+                    ReplySend::Failed(e) => debug!("Failed to send swarm reply to {source}: {e}"),
+                    ReplySend::TimedOut => debug!(
+                        "Swarm reply to {source} abandoned: not handed over in \
+                         {SWARM_REPLY_SEND_TIMEOUT:?}"
+                    ),
                 }
             }
             Err(e) => warn!("Failed to encode swarm reply: {e}"),
         }
+    }
+}
+
+/// Longest a node spends handing one swarm reply to the transport.
+///
+/// A swarm request keeps one of the [`swarm::MAX_SWARM_TASKS`] slots until its
+/// reply is handed over, and the transport's write timeout starts again after
+/// every partial write, so a native client granting its stream credit a few
+/// bytes at a time could otherwise keep a slot as long as it liked, and enough
+/// such replies every slot, dropping every other client's swarm requests. A
+/// reply not handed over in this long is abandoned, as a fetch's busy reply is
+/// (ADR-0025): its client has the silence of a lost reply. The native budget
+/// admits a burst of [`swarm::NATIVE_SWARM_REQUESTS_PER_SECOND`] and as many a
+/// second after it, so replies held this long keep at most 192 slots, fewer
+/// than the 256 above [`swarm::MAX_WAITING`].
+const SWARM_REPLY_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How a reply's hand-over to the transport ended.
+#[derive(Debug, PartialEq, Eq)]
+enum ReplySend<E> {
+    /// The transport took it.
+    Sent,
+    /// The transport refused it.
+    Failed(E),
+    /// Not taken within its time, so abandoned.
+    TimedOut,
+    /// The node began stopping first, so abandoned.
+    Stopped,
+}
+
+/// Runs `send` for at most `limit`, and not past the start of shutdown.
+async fn send_within<E>(
+    send: impl Future<Output = StdResult<(), E>>,
+    stopping: &CancellationToken,
+    limit: Duration,
+) -> ReplySend<E> {
+    tokio::select! {
+        biased;
+        () = stopping.cancelled() => ReplySend::Stopped,
+        handed = timeout(limit, send) => match handed {
+            Ok(Ok(())) => ReplySend::Sent,
+            Ok(Err(e)) => ReplySend::Failed(e),
+            Err(_) => ReplySend::TimedOut,
+        },
     }
 }
 
@@ -1471,9 +1521,13 @@ fn jittered_interval(base: std::time::Duration) -> std::time::Duration {
 mod tests {
     use std::net::SocketAddr;
 
+    use std::future::pending;
+
     use ant_protocol::swarm::SwarmAnnounceRequest;
     use ant_protocol::ChunkMessageBody;
+    use futures::poll;
     use tempfile::TempDir;
+    use tokio::time::Instant as TokioInstant;
 
     use crate::storage::legacy_artifacts::LEGACY_ENV_DIR;
 
@@ -1780,6 +1834,62 @@ mod tests {
         assert!(router.route(&from("198.51.100.5", 0)));
         assert_eq!(over_budget(), u64::from(dropped));
         node.shutdown.cancel();
+    }
+
+    /// A swarm reply the transport never takes, as from a client that grants its
+    /// stream credit a byte at a time, is abandoned at its time and frees its slot.
+    #[tokio::test(start_paused = true)]
+    async fn a_swarm_reply_the_transport_does_not_take_is_abandoned_in_time() {
+        let stopping = CancellationToken::new();
+        let started = TokioInstant::now();
+        let stuck = pending::<StdResult<(), String>>();
+        let outcome = send_within(stuck, &stopping, SWARM_REPLY_SEND_TIMEOUT).await;
+        assert_eq!(outcome, ReplySend::TimedOut);
+        assert_eq!(started.elapsed(), SWARM_REPLY_SEND_TIMEOUT);
+    }
+
+    /// A node that starts stopping abandons a swarm reply still being handed over
+    /// at once, without waiting out its time.
+    #[tokio::test(start_paused = true)]
+    async fn a_stopping_node_abandons_a_swarm_reply_at_once() {
+        let stopping = CancellationToken::new();
+        let started = TokioInstant::now();
+        let stuck = pending::<StdResult<(), String>>();
+        let send = send_within(stuck, &stopping, SWARM_REPLY_SEND_TIMEOUT);
+        tokio::pin!(send);
+        assert!(poll!(send.as_mut()).is_pending());
+        stopping.cancel();
+        assert_eq!(send.await, ReplySend::Stopped);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    /// A reply the transport takes, or refuses, says so.
+    #[tokio::test]
+    async fn a_swarm_reply_send_reports_what_the_transport_did() {
+        let stopping = CancellationToken::new();
+        let sent = send_within(
+            async { Ok::<(), String>(()) },
+            &stopping,
+            SWARM_REPLY_SEND_TIMEOUT,
+        );
+        assert_eq!(sent.await, ReplySend::Sent);
+        let refused = send_within(
+            async { Err::<(), String>("closed".to_string()) },
+            &stopping,
+            SWARM_REPLY_SEND_TIMEOUT,
+        );
+        assert_eq!(refused.await, ReplySend::Failed("closed".to_string()));
+    }
+
+    /// Replies held for their whole time, at the native budget's burst and rate,
+    /// keep fewer slots than those kept beyond the waiting announces.
+    #[test]
+    fn swarm_replies_held_to_their_time_leave_the_announce_slots() {
+        let rate = u64::from(swarm::NATIVE_SWARM_REQUESTS_PER_SECOND);
+        let held = rate + rate * SWARM_REPLY_SEND_TIMEOUT.as_secs();
+        let spare = u64::try_from(swarm::MAX_SWARM_TASKS - swarm::MAX_WAITING).expect("fits");
+        assert_eq!(held, 192);
+        assert!(held < spare, "{held} held vs {spare} spare");
     }
 
     /// A node with chunks in a store this build cannot read STARTS, however it is
