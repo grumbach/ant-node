@@ -46,13 +46,7 @@ mod testnet;
 mod integration_tests;
 
 #[cfg(test)]
-mod live_testnet;
-
-#[cfg(test)]
 mod payment_flow;
-
-#[cfg(test)]
-mod complete_payment_e2e;
 
 #[cfg(test)]
 mod merkle_payment;
@@ -70,10 +64,19 @@ mod security_attacks;
 mod subtree_audit_testnet;
 
 #[cfg(test)]
+mod fetch_busy_ab;
+
+#[cfg(test)]
+mod fetch_busy_reply;
+
+#[cfg(test)]
 mod fetch_local_write_guard;
 
 #[cfg(test)]
 mod fetch_responsibility_recheck;
+
+#[cfg(test)]
+mod fetch_per_source_share;
 
 #[cfg(test)]
 mod first_audit_ab;

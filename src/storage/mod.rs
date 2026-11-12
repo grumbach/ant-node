@@ -58,6 +58,7 @@ mod handler;
 // This crate's own business: the cleanup is called once, from the node builder.
 pub(crate) mod legacy_artifacts;
 pub(crate) mod traffic;
+pub(crate) mod upload_validation;
 
 pub use crate::ant_protocol::XorName;
 pub(crate) use chunk_store::{rename_with_retry, Reservation};
