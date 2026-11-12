@@ -758,15 +758,17 @@ pub struct PaymentVerifier {
     /// settlements sampled rather than chunks admitted.
     merkle_parity_emissions: std::sync::atomic::AtomicUsize,
     /// ADR-0006: chunk addresses whose payment this verifier admitted while the
-    /// price floor contested it (see [`Self::verified_payment_contested`]).
-    /// Written during a full verification, before the payment cache learns
-    /// the chunk, so every later record of it, a cache hit included, is judged
-    /// by the proof that was verified and never by whatever proof came with
-    /// it. Only contested admissions enter, and a chunk is recorded within
-    /// moments of its verification, so the fixed
-    /// [`PRICE_CONTESTED_MEMORY_CAPACITY`], whatever the payment cache is sized
-    /// to, loses a decision before it is read only if that many newer
-    /// contested admissions arrive in between.
+    /// price floor contested it, or refused on price (see
+    /// [`Self::verified_payment_contested`]). Written during a full
+    /// verification, before the payment cache learns the chunk, so every later
+    /// record of it, a cache hit included, is judged by the proof that was
+    /// verified and never by whatever proof came with it. Only contested and
+    /// refused payments enter. An admitted chunk is recorded within moments of
+    /// its verification, so the fixed [`PRICE_CONTESTED_MEMORY_CAPACITY`],
+    /// whatever the payment cache is sized to, loses that decision before it
+    /// is read only if that many newer such payments arrive in between. A
+    /// refused one may be read much later, when repair verification records
+    /// the key, so it lasts only until that many newer ones, or a restart.
     verified_price_contested: Mutex<LruCache<XorName, ()>>,
     /// Configuration.
     config: PaymentVerifierConfig,
@@ -5598,20 +5600,27 @@ mod tests {
     }
 
     /// The fill widens the floor's sample, never the paid quote's issuer
-    /// check: an issuer ranked 21st is refused as not K-close, in the very
-    /// view whose rank-21 commitment would fill the sample.
+    /// check: an issuer ranked 21st is refused as not K-close, in a view that
+    /// the commitment ranked 22nd fills.
     #[tokio::test]
-    async fn a_paid_quote_issuer_ranked_21st_is_refused_where_a_commitment_would_fill() {
+    async fn a_paid_quote_issuer_ranked_21st_is_refused_in_a_filled_view() {
         const RANK_21_INDEX: usize = 20;
         let verifier = floor_test_verifier();
         let xorname = [0xEAu8; 32];
-        let view = attach_floor_view(&verifier, &fourteen_dearest(), 0, &[3_000], Duration::ZERO);
+        // Ranks 1-14 known, 15-20 not, then the issuer at 21 and the fill at 22.
+        let view = attach_floor_view(&verifier, &fourteen_dearest(), 1, &[3_000], Duration::ZERO);
         let (peer_id, quote) = make_signed_quote(xorname, price_at_records(4_400), 1);
         let mut ranked = view;
         ranked.insert(RANK_21_INDEX, *peer_id.as_bytes());
         verifier.set_paid_quote_k_closest_for_tests(ranked);
         mark_candidate_paid(&verifier, &quote, three_times(price_at_records(4_400)));
         let proof_bytes = serialize_proof(vec![(peer_id, quote)]);
+
+        let (reference, sample) = verifier
+            .group_reference_price(&xorname, SampleReach::Filled)
+            .await;
+        assert!(reference.is_some(), "the view is filled and priced");
+        assert_eq!((sample.neighbours, sample.filled), (14, 1));
 
         let err = verifier
             .verify_payment(
@@ -5624,6 +5633,44 @@ mod tests {
         assert!(
             format!("{err}").contains("is not among this node's local K=20 closest"),
             "{err}"
+        );
+    }
+
+    /// The fill starts after the key's 20th closest: a known peer at rank 20
+    /// counts once, in the key-local view, and the 15th neighbour is the one
+    /// at rank 21 (9,000 keys), which moves the lower median from 4,400 to
+    /// 4,600. Counting rank 20 twice would leave it at 4,400.
+    #[tokio::test]
+    async fn the_fill_starts_after_the_keys_20th_closest() {
+        let verifier = floor_test_verifier();
+        let xorname = [0xEBu8; 32];
+        let fourteen = fourteen_dearest();
+        let view = attach_floor_view(&verifier, &fourteen, 0, &[9_000], Duration::ZERO);
+        let (peer_id, quote) = make_signed_quote(xorname, price_at_records(0), 1);
+        // The issuer at rank 1, the 14th known neighbour moved to rank 20, the
+        // peers this node does not know at ranks 15 to 19, the fill at 21.
+        let known: Vec<[u8; 32]> = view.iter().take(14).copied().collect();
+        let unknown: Vec<[u8; 32]> = view.iter().skip(14).take(5).copied().collect();
+        let fill: Vec<[u8; 32]> = view.iter().skip(19).copied().collect();
+        let mut ranked = vec![*peer_id.as_bytes()];
+        ranked.extend(known.iter().take(13));
+        ranked.extend(unknown);
+        ranked.extend(known.get(13));
+        ranked.extend(fill);
+        assert_eq!(ranked.len(), 21);
+        verifier.set_paid_quote_k_closest_for_tests(ranked);
+        mark_candidate_paid(&verifier, &quote, three_times(price_at_records(0)));
+
+        let (reference, sample) = verifier
+            .group_reference_price(&xorname, SampleReach::Filled)
+            .await;
+        assert_eq!(
+            (sample.neighbours, sample.filled, sample.total),
+            (14, 1, 16)
+        );
+        assert_eq!(
+            reference.expect("a filled view is priced").group_median,
+            price_at_records(4_600)
         );
     }
 
