@@ -120,6 +120,31 @@ pub(crate) async fn record_paid_key(key: &XorName, mark: bool, paid_list: &PaidL
     mark || paid_list.counts_as_price_contested(key)
 }
 
+/// Record in the paid list the keys repair verification authorised, by a
+/// presence quorum or a paid-list majority, each by this node's own floor
+/// decision for it (see [`record_paid_key`]).
+///
+/// Repair carries no proof to price. A key is therefore marked when this
+/// node's verifier remembers contesting or refusing a payment for it, so a
+/// node that refused a write on price and later records it because its
+/// group's votes authorised it still judges no peer on it. The memory does not
+/// survive a restart: a key repaired after one is recorded plainly, as every
+/// repaired key was before.
+pub(crate) async fn record_repair_verified_keys(
+    keys: &[XorName],
+    payment_verifier: &PaymentVerifier,
+    paid_list: &PaidList,
+) {
+    for key in keys {
+        record_paid_key(
+            key,
+            payment_verifier.verified_payment_contested(key),
+            paid_list,
+        )
+        .await;
+    }
+}
+
 /// Rules 6-8: record the paid key locally (see [`record_paid_key`]) and
 /// announce it to `PaidCloseGroup(K)`. Returns whether the write's fan-out
 /// must leave its peers unjudged (ADR-0006).
@@ -368,6 +393,45 @@ mod tests {
             .collect();
         assert_eq!(marks, vec![(true, true), (true, false)]);
         assert_eq!(reported, vec![true, false, true, true]);
+    }
+
+    /// ADR-0006: a key repair verification authorises is recorded with this
+    /// node's own floor decision for it: marked when its verifier remembers
+    /// contesting or refusing a payment for it, plainly otherwise, and an
+    /// existing record is left as it is. Repair carries no proof to price, so
+    /// a node that refused a write on price would otherwise record it plainly
+    /// once its group's votes authorise it, and judge its peers on it.
+    #[tokio::test]
+    async fn a_repair_verified_key_keeps_this_nodes_floor_decision() {
+        use crate::payment::{EvmVerifierConfig, PaymentVerifierConfig};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paid_list = PaidList::new(dir.path()).await.expect("paid list");
+        let verifier = PaymentVerifier::new(PaymentVerifierConfig {
+            evm: EvmVerifierConfig::default(),
+            cache_capacity: 16,
+            close_group_size: crate::ant_protocol::CLOSE_GROUP_SIZE,
+            local_rewards_address: evmlib::common::Address::new([1u8; 20]),
+        });
+        let refused = [0x94u8; 32];
+        let plain = [0x95u8; 32];
+        let recorded = [0x96u8; 32];
+        verifier.note_contested_admission_for_tests(&refused);
+        verifier.note_contested_admission_for_tests(&recorded);
+        paid_list.insert(&recorded).await.expect("insert");
+
+        record_repair_verified_keys(&[refused, plain, recorded], &verifier, &paid_list).await;
+
+        let marks: Vec<(bool, bool)> = [refused, plain, recorded]
+            .iter()
+            .map(|key| {
+                (
+                    paid_list.contains(key).expect("contains"),
+                    paid_list.is_price_contested(key).expect("read mark"),
+                )
+            })
+            .collect();
+        assert_eq!(marks, vec![(true, true), (true, false), (true, false)]);
     }
 
     /// ADR-0006: a plain write is left unjudged while the paid list cannot be

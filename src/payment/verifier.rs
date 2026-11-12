@@ -85,9 +85,9 @@ pub const PRICE_FLOOR_TOLERANCE_PERCENT: u64 = 30;
 /// raise of the tolerance moves it first, one release ahead.
 const PRICE_FLOOR_CONTESTED_PERCENT: u64 = 60;
 
-/// Contested chunk admissions the verifier remembers, the most recent first,
-/// so each at least until its paid-list record is written (see
-/// [`PaymentVerifier::verified_payment_contested`]).
+/// Chunk payments the verifier remembers the floor contesting or refusing,
+/// the most recent first, so each at least until its paid-list record is
+/// written (see [`PaymentVerifier::verified_payment_contested`]).
 const PRICE_CONTESTED_MEMORY_CAPACITY: usize = 100_000;
 
 /// Minimum number of fresh NEIGHBOUR commitments (this node's own is counted
@@ -1020,8 +1020,11 @@ impl PaymentVerifier {
         Self::contested(paid_price, reference, sample)
     }
 
-    /// Whether this node admitted a payment for the chunk at `address` that
-    /// the price floor contested when it verified it.
+    /// Whether this node verified a payment for the chunk at `address` that
+    /// the price floor contested, admitted or refused: a node judges no peer
+    /// on a write it refused on price either, however it later records it.
+    /// Held in memory only, so a restart, or 100,000 newer such payments,
+    /// forget it.
     ///
     /// Unlike [`Self::price_contested`], this only ever reflects a proof whose
     /// signature and settlement this node checked: a write admitted later from
@@ -2073,6 +2076,13 @@ impl PaymentVerifier {
         );
 
         if below_floor {
+            // Remembered as a contested admission is, so a later record of the
+            // chunk on this node, from a payment that clears the floor or from
+            // repair, judges no peer on a write this node refused on price
+            // (see `verified_payment_contested`).
+            if let PaymentTarget::Chunk(address) = target {
+                self.verified_price_contested.lock().put(*address, ());
+            }
             return Err(Error::Payment(format!(
                 "Settled payment {settled_amount} is below the close-group price floor \
                  {required_amount} ({PAID_QUOTE_PAYMENT_MULTIPLIER}x {PRICE_FLOOR_TOLERANCE_PERCENT}% of \
@@ -5470,6 +5480,51 @@ mod tests {
         assert!(format!("{err}").contains("below the close-group price floor"));
     }
 
+    /// A chunk write the floor refused is remembered as contested, as one it
+    /// admitted contested is, on a key-local view and on a filled one alike:
+    /// should this node record the key later, from a payment that clears its
+    /// floor or from repair, it judges no peer on a write it refused on price.
+    #[tokio::test]
+    async fn a_chunk_write_refused_on_price_is_remembered_as_contested() {
+        let verifier = floor_test_verifier();
+        let xorname = [0xDBu8; 32];
+        let neighbours =
+            attach_group_commitments(&verifier, &GROUP_TEST_KEY_COUNTS, Duration::ZERO);
+        let proof_bytes = group_floor_proof(
+            &verifier,
+            xorname,
+            0,
+            three_times(price_at_records(0)),
+            &neighbours,
+        );
+        assert!(!verifier.verified_payment_contested(&xorname));
+        verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await
+            .expect_err("a full view refuses a baseline payment");
+        assert!(verifier.verified_payment_contested(&xorname));
+
+        let verifier = floor_test_verifier();
+        let xorname = [0xDCu8; 32];
+        let view = attach_floor_view(&verifier, &fourteen_dearest(), 0, &[3_000], Duration::ZERO);
+        let proof_bytes = floor_view_proof(
+            &verifier,
+            xorname,
+            0,
+            three_times(price_at_records(0)),
+            &view,
+        );
+        verifier
+            .verify_payment(
+                &xorname,
+                Some(&proof_bytes),
+                VerificationContext::PaidListAdmission,
+            )
+            .await
+            .expect_err("a filled view refuses a baseline payment");
+        assert!(verifier.verified_payment_contested(&xorname));
+    }
+
     /// A routing view of one key for the sample-fill tests, nearest first,
     /// with every commitment it lists attached to the gossip cache.
     ///
@@ -6359,8 +6414,9 @@ mod tests {
             "{err}"
         );
         assert!(
-            !verifier.verified_payment_contested(&xorname),
-            "a refused payment is never remembered as an admitted contested one"
+            verifier.verified_payment_contested(&xorname),
+            "a payment refused on price is remembered as contested, so this node \
+             judges no peer on that write however it records it later"
         );
     }
 

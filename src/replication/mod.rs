@@ -1503,6 +1503,7 @@ impl Drop for FreshOfferEntryGuard {
 struct VerificationCycleContext<'a> {
     p2p_node: &'a Arc<P2PNode>,
     paid_list: &'a Arc<PaidList>,
+    payment_verifier: &'a Arc<PaymentVerifier>,
     storage: &'a Arc<ChunkStore>,
     queues: &'a Arc<RwLock<ReplicationQueues>>,
     config: &'a ReplicationConfig,
@@ -4315,6 +4316,7 @@ impl ReplicationEngine {
         let storage = Arc::clone(&self.storage);
         let queues = Arc::clone(&self.queues);
         let paid_list = Arc::clone(&self.paid_list);
+        let payment_verifier = Arc::clone(&self.payment_verifier);
         let config = Arc::clone(&self.config);
         let shutdown = self.shutdown.clone();
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
@@ -4334,6 +4336,7 @@ impl ReplicationEngine {
                         let ctx = VerificationCycleContext {
                             p2p_node: &p2p,
                             paid_list: &paid_list,
+                            payment_verifier: &payment_verifier,
                             storage: &storage,
                             queues: &queues,
                             config: &config,
@@ -8749,6 +8752,7 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
     let VerificationCycleContext {
         p2p_node,
         paid_list,
+        payment_verifier,
         storage,
         queues,
         config,
@@ -9083,11 +9087,7 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                 paid_insert_keys.push(*key);
             }
         }
-        for key in &paid_insert_keys {
-            if let Err(e) = paid_list.insert(key).await {
-                warn!("Failed to add verified key to PaidForList: {e}");
-            }
-        }
+        fresh::record_repair_verified_keys(&paid_insert_keys, payment_verifier, paid_list).await;
 
         // Verification established validity; the paid-list insert above records
         // it. Downloading the bytes is a separate duty, owed only by the
