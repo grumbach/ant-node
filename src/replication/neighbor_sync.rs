@@ -64,15 +64,17 @@ pub(crate) struct PeerSyncHints {
 /// This considers every locally stored record, not only those this node is still
 /// responsible for: an out-of-range record it keeps still repairs its new close
 /// group. Only the key ranges where the peer can be in the group are read.
+/// Price-contested records are left out (ADR-0006).
 pub async fn build_replica_hints_for_peer(
     peer: &PeerId,
     storage: &Arc<ChunkStore>,
+    paid_list: &PaidList,
     p2p_node: &Arc<P2PNode>,
     close_group_size: usize,
 ) -> Vec<XorName> {
     let targets = HashSet::from([*peer]);
     let groups = CloseGroupMap::new(close_group_candidates(p2p_node).await, close_group_size);
-    let (mut hints, _) = replica_hints(&groups, storage, &targets).await;
+    let (mut hints, _) = replica_hints(&groups, storage, paid_list, &targets).await;
     hints
         .remove(peer)
         .unwrap_or_default()
@@ -118,14 +120,29 @@ async fn for_each_hinted_key(
 
 /// Replica hints from the stored records for each of `targets`, and how many
 /// stored keys were read.
+///
+/// A stored key marked price-contested in the paid list (ADR-0006, see
+/// `fresh::record_paid_key`) is left out: it goes out as a paid hint only. A
+/// replica hint records a repair proof the responsible audit later judges the
+/// peer on, and makes this node the sole hinter a peer penalises when its
+/// quorum check fails; a paid hint does neither. Paid hints have no distance
+/// limit either, so a marked record this node keeps far from itself (ADR-0028)
+/// still reaches its close group through its paid entry. The marks are read
+/// from memory, so this reads nothing more on disk; if they could not be read
+/// when the paid list opened, every stored key counts as marked and none is
+/// hinted as a replica.
 async fn replica_hints(
     groups: &CloseGroupMap,
     storage: &ChunkStore,
+    paid_list: &PaidList,
     targets: &HashSet<PeerId>,
 ) -> (HashMap<PeerId, Vec<SentReplicaHint>>, usize) {
     let (ranges, bounds) = ranges_holding(groups, targets);
-    let keys = storage.keys_in_ranges(&bounds);
+    let mut keys = storage.keys_in_ranges(&bounds);
     let keys_read = keys.iter().map(Vec::len).sum();
+    for range_keys in &mut keys {
+        paid_list.retain_unmarked(range_keys);
+    }
     let mut hints: HashMap<PeerId, Vec<SentReplicaHint>> = HashMap::new();
     for_each_hinted_key(groups, ranges, keys, targets, |key, group| {
         let close_peers: HashSet<PeerId> = group.into_iter().collect();
@@ -194,7 +211,8 @@ pub(crate) async fn build_sync_hints_for_peers(
     let record_groups = CloseGroupMap::new(candidates.iter().copied(), close_group_size);
     let paid_groups = CloseGroupMap::new(candidates, paid_list_close_group_size);
 
-    let (replica, stored_keys_read) = replica_hints(&record_groups, storage, &targets).await;
+    let (replica, stored_keys_read) =
+        replica_hints(&record_groups, storage, paid_list, &targets).await;
     for (peer, hints) in replica {
         if let Some(peer_hints) = hints_by_peer.get_mut(&peer) {
             peer_hints.sent_replica_hints = hints;
@@ -586,6 +604,7 @@ pub(crate) async fn handle_sync_request_with_proofs(
 mod tests {
     use super::*;
     use crate::replication::types::PeerSyncRecord;
+    use crate::storage::ChunkStoreConfig;
     use std::collections::HashMap;
 
     /// Build a `PeerId` from a single byte (zero-padded to 32 bytes).
@@ -638,6 +657,71 @@ mod tests {
             vec![keys[0], keys[2]],
             "0100 goes to 0000, not 0001"
         );
+    }
+
+    /// ADR-0006: a stored key marked price-contested is never hinted as a
+    /// replica, wherever it lies, and still goes out as a paid hint to the
+    /// peers its replica hint would have reached; every other stored key is
+    /// still hinted as a replica. The marks are read from memory, so this works
+    /// while no paid-list read can run. While the marks are unknown, no stored
+    /// key is hinted as a replica.
+    #[tokio::test]
+    async fn a_price_contested_key_goes_out_as_a_paid_hint_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = ChunkStore::new(ChunkStoreConfig {
+            root_dir: dir.path().join("chunks"),
+            ..ChunkStoreConfig::test_default()
+        })
+        .await
+        .expect("chunk store");
+        let paid_list = PaidList::new(dir.path()).await.expect("paid list");
+        let contents: [&[u8]; 3] = [b"plain record", b"contested record", b"unpaid record"];
+        let [plain, contested, unpaid] = contents.map(ChunkStore::compute_address);
+        for (key, content) in [plain, contested, unpaid].iter().zip(contents) {
+            storage.put(key, content).await.expect("put");
+        }
+        paid_list.insert(&plain).await.expect("insert");
+        paid_list
+            .insert_price_contested(&contested)
+            .await
+            .expect("mark");
+
+        // Two peers in groups of two: the target is in every key's group.
+        let target = peer_id_from_byte(0b0001_0000);
+        let groups = CloseGroupMap::new([peer_id_from_byte(0), target], 2);
+        let targets = HashSet::from([target]);
+        let sorted = |mut keys: Vec<XorName>| {
+            keys.sort_unstable();
+            keys
+        };
+        let replica_keys = |hints: HashMap<PeerId, Vec<SentReplicaHint>>| {
+            sorted(
+                hints
+                    .get(&target)
+                    .map(|hints| hints.iter().map(|hint| hint.key).collect())
+                    .unwrap_or_default(),
+            )
+        };
+
+        let reader = paid_list.hold_reader_for_tests().expect("hold reader");
+        assert!(paid_list.is_price_contested(&contested).is_err());
+        let (replica, read) = replica_hints(&groups, &storage, &paid_list, &targets).await;
+        assert_eq!(read, 3, "every stored key is read");
+        assert_eq!(replica_keys(replica), sorted(vec![plain, unpaid]));
+        drop(reader);
+
+        let (paid, _) = paid_hints(&groups, &paid_list, &targets)
+            .await
+            .expect("paid hints");
+        assert_eq!(
+            sorted(paid.get(&target).cloned().unwrap_or_default()),
+            sorted(vec![plain, contested]),
+            "the marked key reaches the same peer as a paid hint"
+        );
+
+        paid_list.forget_marks_for_tests();
+        let (unknown, _) = replica_hints(&groups, &storage, &paid_list, &targets).await;
+        assert!(replica_keys(unknown).is_empty(), "no replica hint");
     }
 
     // -- select_sync_batch ---------------------------------------------------

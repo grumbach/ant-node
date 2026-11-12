@@ -82,6 +82,9 @@ mod fetch_per_source_share;
 mod first_audit_ab;
 
 #[cfg(test)]
+mod price_floor_ab;
+
+#[cfg(test)]
 mod fresh_offer_capacity;
 
 #[cfg(test)]
