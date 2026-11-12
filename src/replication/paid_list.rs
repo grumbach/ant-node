@@ -239,14 +239,21 @@ struct PriceRefusals {
     cap: usize,
     /// Whether the saturated entry is committed.
     saturated: Arc<AtomicBool>,
-    /// Whether a read or a write of the store has failed since the node
-    /// started, so a refusal may be missing from it. Until restart every new
-    /// paid-list record is then marked: when in doubt, judge no one.
+    /// Whether a refusal has failed to commit since the node started, so one
+    /// may be missing from the store. Until restart every new paid-list
+    /// record is then marked: when in doubt, judge no one.
     in_doubt: Arc<AtomicBool>,
+    /// Reads that have failed since the last one that succeeded, so a run of
+    /// failures is logged once (see `marks`).
+    failed_reads: Arc<AtomicU64>,
     /// Test-only: the faults the store is told to hit
     /// ([`FAIL_PRICE_REFUSAL_WRITES`], [`FAIL_PRICE_REFUSAL_READS`]).
     #[cfg(test)]
     faults: Arc<AtomicU8>,
+    /// Test-only: how many lookups have started, counted before each opens
+    /// its transaction.
+    #[cfg(test)]
+    lookups_started: Arc<AtomicU64>,
 }
 
 impl PriceRefusals {
@@ -274,47 +281,61 @@ impl PriceRefusals {
         let db: Database<Bytes, Bytes> = env
             .create_database(&mut wtxn, None)
             .map_err(|e| Error::Storage(format!("Failed to create price-refusal database: {e}")))?;
+        // Read in the transaction that opened the database: a store whose
+        // saturation cannot be read does not open, like any other.
+        let saturated = db
+            .get(&wtxn, PRICE_REFUSALS_SATURATED_KEY)
+            .map_err(|e| Error::Storage(format!("Failed to read price-refusal store: {e}")))?
+            .is_some();
         wtxn.commit()
             .map_err(|e| Error::Storage(format!("Failed to commit db creation: {e}")))?;
-        // A write transaction, dropped uncommitted, takes no reader slot (see
-        // `holds`).
-        let saturated = env
-            .write_txn()
-            .and_then(|txn| Ok(db.get(&txn, PRICE_REFUSALS_SATURATED_KEY)?.is_some()));
-        let refusals = Self {
+        if saturated {
+            warn!(
+                "Price-refusal store is full ({cap} addresses): every key this node records \
+                 in its paid list is marked price-contested"
+            );
+        }
+        Ok(Self {
             env,
             db,
             cap,
-            saturated: Arc::new(AtomicBool::new(false)),
+            saturated: Arc::new(AtomicBool::new(saturated)),
             in_doubt: Arc::new(AtomicBool::new(false)),
+            failed_reads: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             faults: Arc::new(AtomicU8::new(0)),
-        };
-        match saturated {
-            Ok(true) => {
-                refusals.saturated.store(true, Ordering::Release);
-                warn!(
-                    "Price-refusal store is full ({cap} addresses): every key this node records \
-                     in its paid list is marked price-contested"
-                );
-            }
-            Ok(false) => {}
-            Err(e) => refusals.doubt(&e),
-        }
-        Ok(refusals)
+            #[cfg(test)]
+            lookups_started: Arc::new(AtomicU64::new(0)),
+        })
     }
 
     /// Whether a new paid-list record of `key` must be marked: this node
-    /// refused a payment for it on price, or the store is saturated or in
-    /// doubt. A read that fails puts the store in doubt.
+    /// refused a payment for it on price, the store is saturated or in
+    /// doubt, or the store cannot be read just now. A failed read loses no
+    /// refusal, so it marks only the record that made it, and a run of them
+    /// is logged once.
     fn marks(&self, key: &XorName) -> bool {
         if self.saturated.load(Ordering::Acquire) || self.in_doubt.load(Ordering::Acquire) {
             return true;
         }
-        self.holds(key).unwrap_or_else(|e| {
-            self.doubt(&e);
-            true
-        })
+        match self.holds(key) {
+            Ok(held) => {
+                let failed = self.failed_reads.swap(0, Ordering::AcqRel);
+                if failed > 0 {
+                    info!("Price-refusal store reads again, after {failed} failed reads");
+                }
+                held
+            }
+            Err(e) => {
+                if self.failed_reads.fetch_add(1, Ordering::AcqRel) == 0 {
+                    warn!(
+                        "Cannot read the price-refusal store ({e}): every key this node records \
+                         is marked price-contested until it can"
+                    );
+                }
+                true
+            }
+        }
     }
 
     /// Whether `key` is held as refused.
@@ -324,6 +345,8 @@ impl PriceRefusals {
     /// reader slot for each blocking-pool thread that ever ran one, and once
     /// the table's 126 were taken every lookup would fail.
     fn holds(&self, key: &XorName) -> heed::Result<bool> {
+        #[cfg(test)]
+        self.lookups_started.fetch_add(1, Ordering::AcqRel);
         #[cfg(test)]
         if self.faults.load(Ordering::Acquire) & FAIL_PRICE_REFUSAL_READS != 0 {
             return Err(heed::Error::Io(std::io::Error::other(
@@ -371,12 +394,13 @@ impl PriceRefusals {
         Ok(())
     }
 
-    /// Put the store in doubt until restart, warning the first time.
+    /// Put the store in doubt until restart after a refusal failed to
+    /// commit, warning the first time.
     fn doubt(&self, e: &dyn Display) {
         if !self.in_doubt.swap(true, Ordering::AcqRel) {
             warn!(
-                "Price-refusal store failed ({e}): until this node restarts, every key it \
-                 records in its paid list is marked price-contested"
+                "A price refusal could not be committed ({e}): until this node restarts, \
+                 every key it records in its paid list is marked price-contested"
             );
         }
     }
@@ -602,6 +626,12 @@ impl PaidList {
             .blocking_tracker
             .spawn_blocking(move || -> heed::Result<Option<&'static [u8]>> {
                 let ordered = write_order.lock();
+                // Read under the write order, which every refusal is written
+                // under too, so a refusal is either committed and read here or
+                // written after this record, which it then leaves as it is.
+                // Read before the write transaction below opens, so this
+                // thread never holds both environments' writers at once.
+                let marks = value.is_empty() && refusals.marks(&key_owned);
                 let mut wtxn = env.write_txn()?;
 
                 // Authoritative existence check inside the serialized write txn.
@@ -609,14 +639,7 @@ impl PaidList {
                     return Ok(None);
                 }
 
-                // Read under the write order, which every refusal is written
-                // under too, so a refusal is either committed and read here or
-                // written after this record, which it then leaves as it is.
-                let value = if value.is_empty() && refusals.marks(&key_owned) {
-                    PRICE_CONTESTED_VALUE
-                } else {
-                    value
-                };
+                let value = if marks { PRICE_CONTESTED_VALUE } else { value };
                 db.put(&mut wtxn, &key_owned, value)?;
                 if !value.is_empty() {
                     if let Some(keys) = price_contested.write().as_mut() {
@@ -2305,18 +2328,61 @@ mod tests {
         assert!(pl.is_price_contested(&kept).expect("read mark"));
     }
 
-    /// A refusal store that cannot be read marks the record, and stays in
-    /// doubt once reads succeed again.
+    /// A record whose look at the refusal store fails is marked: it cannot
+    /// tell whether the key was refused. A failed read loses no refusal, so
+    /// once reads succeed again new records are judged by the store, while
+    /// a refused key stays marked.
     #[tokio::test]
-    async fn an_unreadable_price_refusal_store_marks_every_new_record() {
+    async fn a_record_whose_refusal_lookup_fails_is_marked() {
         let (pl, _temp) = create_test_paid_list().await;
+        let (refused, unread, after) = ([0x96; 32], [0x97; 32], [0xA3; 32]);
+        pl.record_price_refusal(&refused).await.expect("refusal");
         pl.set_price_refusal_faults_for_tests(FAIL_PRICE_REFUSAL_READS);
-        pl.insert(&[0x96; 32]).await.expect("insert");
-        assert!(pl.is_price_contested(&[0x96; 32]).expect("read mark"));
+        pl.insert(&unread).await.expect("insert");
+        assert!(pl.is_price_contested(&unread).expect("read mark"));
 
         pl.set_price_refusal_faults_for_tests(0);
-        pl.insert(&[0x97; 32]).await.expect("insert");
-        assert!(pl.is_price_contested(&[0x97; 32]).expect("read mark"));
+        pl.insert(&after).await.expect("insert");
+        assert!(!pl.is_price_contested(&after).expect("read mark"));
+        pl.insert(&refused).await.expect("insert");
+        assert!(pl.is_price_contested(&refused).expect("read mark"));
+    }
+
+    /// A first record looks at the refusal store before it opens the paid
+    /// list's write transaction, so it never holds one LMDB writer while it
+    /// waits for the other: with the refusal store's writer held elsewhere,
+    /// a record parked on it leaves the paid list's writer free.
+    #[tokio::test]
+    async fn a_first_record_never_holds_both_writers() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let (release, holder) = hold_refusal_write_txn(&pl).await;
+        let record = pl.insert(&[0xA4; 32]);
+        tokio::pin!(record);
+        let started = async {
+            while pl.refusals.lookups_started.load(Ordering::Acquire) == 0 {
+                tokio::time::sleep(WRITE_ORDER_POLL).await;
+            }
+        };
+        tokio::select! {
+            output = record.as_mut() => panic!("the record must be parked, got {output:?}"),
+            started = tokio::time::timeout(WAIT_IDLE_COMPLETE_TIMEOUT, started) => {
+                started.expect("the record starts its refusal lookup");
+            }
+        }
+
+        // The record is now inside its lookup, waiting for the refusal
+        // store's writer, so whatever it would hold it already holds.
+        let env = pl.env.clone();
+        let paid_writer = spawn_blocking(move || env.write_txn().map(drop).is_ok());
+        let free = tokio::time::timeout(WAIT_IDLE_COMPLETE_TIMEOUT, paid_writer)
+            .await
+            .expect("the paid list's writer must be free while the record waits")
+            .expect("writer probe");
+        assert!(free);
+
+        drop(release);
+        holder.await.expect("holder task");
+        assert!(record.await.expect("insert"));
     }
 
     /// Return once a blocking task holds the paid list's write order, the

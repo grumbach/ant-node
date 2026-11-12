@@ -382,8 +382,11 @@ replication), arriving in 48 upload bursts. Of those, 1,801 admissions over
    addresses (128 MiB). A refusal of a new address past that saturates it
    instead, and from then on, across restarts, the node marks every key it
    records. If a refusal cannot be committed, the node reports a storage
-   error instead of the refusal, and if the store cannot be written or
-   read, the node marks every key it records until it restarts. An
+   error instead of the refusal and, since a refusal may then be missing,
+   marks every key it records until it restarts. A record whose look at
+   the store fails is marked; a failed read loses no refusal, so it marks
+   nothing else. A first record reads the store before it opens the paid
+   list's write transaction, so it never holds both writers at once. An
    existing paid entry keeps its mark either way.
 
    An admitted contested write, one the node cannot price or one paid between
@@ -671,8 +674,8 @@ out of 1,801:
   near-empty quoter leave gas as the main cost. The node then marks every
   key it records from then on, so it stops hinting new keys as replicas and
   auditing its peers on them. Its existing entries, and the other holders'
-  checks, are unchanged. A refusal store that cannot be written or read
-  does the same until the node restarts.
+  checks, are unchanged. A refusal that cannot be committed does the same
+  until the node restarts.
 - **Rollout skew is the main rollout risk.** Until the fleet upgrades, a node
   on an older release admits every payment and still probes every
   fresh-offer target 5 to 15 minutes later. Each upgraded peer that refused a
@@ -747,10 +750,12 @@ out of 1,801:
     keeps its mark; a pointer refused on price, or a proof that fails before
     the floor, keeps nothing; the store saturates past its cap and stays
     saturated after a restart; a refusal that cannot be committed, or one
-    made after the paid list has closed, is a storage error; a failed write
-    or read marks every new record until restart; a refusal and a first
-    record of its key never interleave, and the refusal of a dropped caller
-    still commits before `wait_idle` returns;
+    made after the paid list has closed, is a storage error; a failed
+    commit marks every new record until restart, also when its caller was
+    dropped, and a failed lookup marks only its own record; a refusal and
+    a first record of its key never interleave, a first record never holds
+    both writers, a lookup takes no reader slot, and the refusal of a
+    dropped caller still commits before `wait_idle` returns;
   - only a paid-list admission fills a thin sample, within rank 60 and only
     to the gate, and a write a filled view admits is contested;
   - a marked key is left out of replica hints, from the in-memory marks
