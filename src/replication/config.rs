@@ -98,6 +98,20 @@ const _: () = assert!(
     "the paid list must start evicting before its store is full"
 );
 
+/// LMDB map size for the price refusals kept beside the paid list (ADR-0006):
+/// 128 MiB. Like the paid list's, the store's file grows as entries do.
+pub const PRICE_REFUSALS_MAP_SIZE: usize = 128 * 1_024 * 1_024;
+
+/// Chunk addresses the price-refusal store keeps (ADR-0006). A refusal of a
+/// new address past this saturates the store instead, so from then on the
+/// node marks every key it records.
+pub const PRICE_REFUSALS_CAP: usize = 1_000_000;
+
+const _: () = assert!(
+    (PRICE_REFUSALS_CAP + 1) * PAID_LIST_MAP_BYTES_PER_ENTRY < PRICE_REFUSALS_MAP_SIZE / 2,
+    "the price-refusal store must saturate well before its map is full"
+);
+
 /// Most paid-list entries one prune pass evicts.
 pub const MAX_PAID_EVICTIONS_PER_PASS: usize = 100_000;
 

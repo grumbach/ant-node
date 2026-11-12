@@ -10,6 +10,7 @@
 //!
 //! ```text
 //! {root}/paid_list.mdb/           -- LMDB environment directory
+//! {root}/price_refusals.mdb/      -- LMDB environment of price refusals
 //! {root}/record_out_of_range.bin  -- saved `RecordOutOfRangeFirstSeen` clocks
 //! ```
 //!
@@ -20,11 +21,15 @@
 //! marked keys are also held in memory, so hint construction never scans the
 //! database for them. Keys sort by their bytes, so the keys sharing a prefix
 //! with a given key are one contiguous range.
+//!
+//! The chunk payments this node refused on price are kept in an environment
+//! of their own, so no refusal is ever read as paid (see
+//! [`PaidList::record_price_refusal`]).
 
 use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};
 use crate::logging::{debug, error, info, trace, warn};
-use crate::replication::config::PAID_LIST_MAP_SIZE;
+use crate::replication::config::{PAID_LIST_MAP_SIZE, PRICE_REFUSALS_CAP, PRICE_REFUSALS_MAP_SIZE};
 use crate::replication::out_of_range_clocks::OutOfRangeClocks;
 use heed::types::Bytes;
 #[cfg(test)]
@@ -32,10 +37,13 @@ use heed::WithTls;
 use heed::{Database, Env, EnvOpenOptions, MdbError, RoTxn};
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashSet;
+use std::fmt::Display;
 use std::future::Future;
 use std::ops::Bound;
 use std::path::Path;
 use std::slice;
+#[cfg(test)]
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -47,6 +55,22 @@ use crate::ant_protocol::XORNAME_LEN;
 /// Value stored for a key whose payment the price floor contested here (see
 /// `fresh::record_paid_key`).
 const PRICE_CONTESTED_VALUE: &[u8] = &[1];
+
+/// Directory under the root holding the price-refusal environment.
+const PRICE_REFUSALS_DIR: &str = "price_refusals.mdb";
+
+/// The one price-refusal entry that says the store is saturated. It is not
+/// 32 bytes long, so no chunk address can take it.
+const PRICE_REFUSALS_SATURATED_KEY: &[u8] = b"saturated";
+
+/// Test-only fault: every price-refusal write fails after its put, before it
+/// commits.
+#[cfg(test)]
+pub(crate) const FAIL_PRICE_REFUSAL_WRITES: u8 = 1;
+
+/// Test-only fault: every price-refusal read fails.
+#[cfg(test)]
+pub(crate) const FAIL_PRICE_REFUSAL_READS: u8 = 2;
 
 /// Bits in one byte of a key.
 const BITS_PER_BYTE: usize = 8;
@@ -155,13 +179,14 @@ fn visit_range(
 }
 
 /// What the open task returns: the environment, the database, the saved record
-/// clocks and the keys marked price-contested in the database, if they could
-/// be read.
+/// clocks, the keys marked price-contested in the database, if they could be
+/// read, and the price refusals.
 type OpenedPaidList = (
     Env,
     Database<Bytes, Bytes>,
     OutOfRangeClocks,
     Result<HashSet<XorName>>,
+    PriceRefusals,
 );
 
 /// Every key whose entry in `db` carries the price-contested mark.
@@ -197,6 +222,166 @@ fn unmark_in_memory(marks: &RwLock<Option<Arc<HashSet<XorName>>>>, keys: &[XorNa
     }
 }
 
+/// The chunk payments this node refused on price (ADR-0006), each a 32-byte
+/// address with an empty value, in an LMDB environment of their own: nothing
+/// that reads the paid set, so no paid-list check, count, hint or vote, ever
+/// sees one. Read and written only under the paid list's `write_order`.
+///
+/// Holds at most `cap` addresses and is never pruned: a key whose paid entry
+/// is evicted can come back through repair, and must come back marked. The
+/// refusal of a new address past `cap` writes the saturated entry instead,
+/// and from then on, across restarts, every new paid-list record is marked.
+#[derive(Clone)]
+struct PriceRefusals {
+    env: Env,
+    db: Database<Bytes, Bytes>,
+    /// Addresses kept before the store saturates.
+    cap: usize,
+    /// Whether the saturated entry is committed.
+    saturated: Arc<AtomicBool>,
+    /// Whether a read or a write of the store has failed since the node
+    /// started, so a refusal may be missing from it. Until restart every new
+    /// paid-list record is then marked: when in doubt, judge no one.
+    in_doubt: Arc<AtomicBool>,
+    /// Test-only: the faults the store is told to hit
+    /// ([`FAIL_PRICE_REFUSAL_WRITES`], [`FAIL_PRICE_REFUSAL_READS`]).
+    #[cfg(test)]
+    faults: Arc<AtomicU8>,
+}
+
+impl PriceRefusals {
+    /// Open or create the store under `root_dir`. Runs on the blocking pool.
+    #[allow(unsafe_code)]
+    fn open(root_dir: &Path, cap: usize) -> Result<Self> {
+        let env_dir = root_dir.join(PRICE_REFUSALS_DIR);
+        std::fs::create_dir_all(&env_dir).map_err(|e| {
+            Error::Storage(format!("Failed to create price-refusal directory: {e}"))
+        })?;
+        // SAFETY: as for the paid list's environment, each node instance has
+        // a root directory of its own, so no two processes open this one.
+        let env = unsafe {
+            EnvOpenOptions::new()
+                .map_size(PRICE_REFUSALS_MAP_SIZE)
+                .max_dbs(1)
+                .open(&env_dir)
+                .map_err(|e| {
+                    Error::Storage(format!("Failed to open price-refusal LMDB env: {e}"))
+                })?
+        };
+        let mut wtxn = env
+            .write_txn()
+            .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
+        let db: Database<Bytes, Bytes> = env
+            .create_database(&mut wtxn, None)
+            .map_err(|e| Error::Storage(format!("Failed to create price-refusal database: {e}")))?;
+        wtxn.commit()
+            .map_err(|e| Error::Storage(format!("Failed to commit db creation: {e}")))?;
+        // A write transaction, dropped uncommitted, takes no reader slot (see
+        // `holds`).
+        let saturated = env
+            .write_txn()
+            .and_then(|txn| Ok(db.get(&txn, PRICE_REFUSALS_SATURATED_KEY)?.is_some()));
+        let refusals = Self {
+            env,
+            db,
+            cap,
+            saturated: Arc::new(AtomicBool::new(false)),
+            in_doubt: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            faults: Arc::new(AtomicU8::new(0)),
+        };
+        match saturated {
+            Ok(true) => {
+                refusals.saturated.store(true, Ordering::Release);
+                warn!(
+                    "Price-refusal store is full ({cap} addresses): every key this node records \
+                     in its paid list is marked price-contested"
+                );
+            }
+            Ok(false) => {}
+            Err(e) => refusals.doubt(&e),
+        }
+        Ok(refusals)
+    }
+
+    /// Whether a new paid-list record of `key` must be marked: this node
+    /// refused a payment for it on price, or the store is saturated or in
+    /// doubt. A read that fails puts the store in doubt.
+    fn marks(&self, key: &XorName) -> bool {
+        if self.saturated.load(Ordering::Acquire) || self.in_doubt.load(Ordering::Acquire) {
+            return true;
+        }
+        self.holds(key).unwrap_or_else(|e| {
+            self.doubt(&e);
+            true
+        })
+    }
+
+    /// Whether `key` is held as refused.
+    ///
+    /// Read in a write transaction dropped uncommitted, which the paid list's
+    /// write order leaves free to take: a read transaction would keep an LMDB
+    /// reader slot for each blocking-pool thread that ever ran one, and once
+    /// the table's 126 were taken every lookup would fail.
+    fn holds(&self, key: &XorName) -> heed::Result<bool> {
+        #[cfg(test)]
+        if self.faults.load(Ordering::Acquire) & FAIL_PRICE_REFUSAL_READS != 0 {
+            return Err(heed::Error::Io(std::io::Error::other(
+                "injected read fault",
+            )));
+        }
+        let txn = self.env.write_txn()?;
+        Ok(self.db.get(&txn, key.as_ref())?.is_some())
+    }
+
+    /// Commit `key` as refused, or the saturated entry when `key` is new and
+    /// the store holds `cap` addresses. A key already held, or a saturated
+    /// store, writes nothing.
+    fn record(&self, key: &XorName) -> heed::Result<()> {
+        if self.saturated.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut wtxn = self.env.write_txn()?;
+        if self.db.get(&wtxn, key.as_ref())?.is_some() {
+            return Ok(());
+        }
+        let held = usize::try_from(self.db.len(&wtxn)?).unwrap_or(usize::MAX);
+        let saturating = held >= self.cap;
+        let entry: &[u8] = if saturating {
+            PRICE_REFUSALS_SATURATED_KEY
+        } else {
+            key.as_ref()
+        };
+        self.db.put(&mut wtxn, entry, &[])?;
+        #[cfg(test)]
+        if self.faults.load(Ordering::Acquire) & FAIL_PRICE_REFUSAL_WRITES != 0 {
+            return Err(heed::Error::Io(std::io::Error::other(
+                "injected commit fault",
+            )));
+        }
+        wtxn.commit()?;
+        if saturating {
+            self.saturated.store(true, Ordering::Release);
+            error!(
+                "Price-refusal store is full ({} addresses): from now on every key this node \
+                 records in its paid list is marked price-contested",
+                self.cap
+            );
+        }
+        Ok(())
+    }
+
+    /// Put the store in doubt until restart, warning the first time.
+    fn doubt(&self, e: &dyn Display) {
+        if !self.in_doubt.swap(true, Ordering::AcqRel) {
+            warn!(
+                "Price-refusal store failed ({e}): until this node restarts, every key it \
+                 records in its paid list is marked price-contested"
+            );
+        }
+    }
+}
+
 /// Persistent paid-for-list backed by LMDB.
 ///
 /// Tracks which keys this node believes are paid-authorized.
@@ -225,16 +410,19 @@ pub struct PaidList {
     /// Mark reads that have failed since the last one that succeeded, so a
     /// run of failures is logged once (see `counts_as_price_contested`).
     failed_mark_reads: AtomicU64,
+    /// The chunk payments this node refused on price, which mark the first
+    /// record of their key (see [`Self::record_price_refusal`]).
+    refusals: PriceRefusals,
     /// When each stored record first went out of storage-responsibility range.
     record_out_of_range: OutOfRangeClocks,
     /// Whether a full store has been reported, so it is reported only once.
     full_reported: AtomicBool,
-    /// Tracks every paid-list LMDB blocking task.
+    /// Tracks every paid-list and price-refusal LMDB blocking task.
     ///
     /// Same rationale as `ChunkStore::blocking_tracker`: a `spawn_blocking`
     /// closure owns a cloned [`Env`] and keeps running when its async awaiter
     /// is dropped, so [`Self::wait_idle`] waits on the blocking tasks
-    /// themselves before the environment may be reopened.
+    /// themselves before either environment may be reopened.
     blocking_tracker: TaskTracker,
     /// Test-only: parks an eviction between its scan and its removal.
     #[cfg(test)]
@@ -252,25 +440,38 @@ pub struct PaidList {
 }
 
 impl PaidList {
-    /// Open or create a `PaidList` backed by LMDB at `{root_dir}/paid_list.mdb/`.
+    /// Open or create a `PaidList` backed by LMDB at `{root_dir}/paid_list.mdb/`,
+    /// with its price refusals at `{root_dir}/price_refusals.mdb/`.
     ///
     /// # Errors
     ///
-    /// Returns an error if the LMDB environment cannot be opened or the
+    /// Returns an error if either LMDB environment cannot be opened or its
     /// database cannot be created.
-    #[allow(unsafe_code)]
     pub async fn new(root_dir: &Path) -> Result<Self> {
+        Self::open(root_dir, PRICE_REFUSALS_CAP).await
+    }
+
+    /// [`Self::new`] with a price-refusal store that saturates past `cap`
+    /// addresses.
+    #[cfg(test)]
+    pub(crate) async fn with_refusal_cap(root_dir: &Path, cap: usize) -> Result<Self> {
+        Self::open(root_dir, cap).await
+    }
+
+    #[allow(unsafe_code)]
+    async fn open(root_dir: &Path, refusal_cap: usize) -> Result<Self> {
         let env_dir = root_dir.join("paid_list.mdb");
 
         std::fs::create_dir_all(&env_dir)
             .map_err(|e| Error::Storage(format!("Failed to create paid-list directory: {e}")))?;
 
         let env_dir_clone = env_dir.clone();
+        let root_dir_clone = root_dir.to_path_buf();
         let record_clocks_path = root_dir.join(RECORD_CLOCKS_FILE);
         // Constructor-only blocking task: it runs before `self` (and its
         // `blocking_tracker`) exists, so it is deliberately untracked.  The
         // constructor awaits it right here, so it cannot outlive this call.
-        let (env, db, record_out_of_range, price_contested) =
+        let (env, db, record_out_of_range, price_contested, refusals) =
             spawn_blocking(move || -> Result<OpenedPaidList> {
                 // SAFETY: `EnvOpenOptions::open()` is unsafe because LMDB uses
                 // memory-mapped I/O and relies on OS file-locking to prevent
@@ -304,12 +505,14 @@ impl PaidList {
                     .write_txn()
                     .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))
                     .and_then(|scan| read_price_contested_keys(&db, &scan));
+                let refusals = PriceRefusals::open(&root_dir_clone, refusal_cap)?;
 
                 Ok((
                     env,
                     db,
                     OutOfRangeClocks::load(record_clocks_path),
                     price_contested,
+                    refusals,
                 ))
             })
             .await
@@ -332,6 +535,7 @@ impl PaidList {
             price_contested: Arc::new(RwLock::new(price_contested)),
             write_order: Arc::new(Mutex::new(())),
             failed_mark_reads: AtomicU64::new(0),
+            refusals,
             record_out_of_range,
             full_reported: AtomicBool::new(false),
             blocking_tracker: TaskTracker::new(),
@@ -377,6 +581,9 @@ impl PaidList {
         self.insert_with_value(key, PRICE_CONTESTED_VALUE).await
     }
 
+    /// Insert `key` with `value`, unless it is already present. A new entry
+    /// is marked whatever `value` asks when this node refused a payment for
+    /// the key on price (see [`Self::record_price_refusal`]).
     async fn insert_with_value(&self, key: &XorName, value: &'static [u8]) -> Result<bool> {
         // Fast-path: avoid write transaction if key already present.
         if self.contains(key)? {
@@ -389,18 +596,27 @@ impl PaidList {
         let db = self.db;
         let price_contested = Arc::clone(&self.price_contested);
         let write_order = Arc::clone(&self.write_order);
+        let refusals = self.refusals.clone();
 
-        let was_new = self
+        let written = self
             .blocking_tracker
-            .spawn_blocking(move || -> heed::Result<bool> {
+            .spawn_blocking(move || -> heed::Result<Option<&'static [u8]>> {
                 let ordered = write_order.lock();
                 let mut wtxn = env.write_txn()?;
 
                 // Authoritative existence check inside the serialized write txn.
                 if db.get(&wtxn, &key_owned)?.is_some() {
-                    return Ok(false);
+                    return Ok(None);
                 }
 
+                // Read under the write order, which every refusal is written
+                // under too, so a refusal is either committed and read here or
+                // written after this record, which it then leaves as it is.
+                let value = if value.is_empty() && refusals.marks(&key_owned) {
+                    PRICE_CONTESTED_VALUE
+                } else {
+                    value
+                };
                 db.put(&mut wtxn, &key_owned, value)?;
                 if !value.is_empty() {
                     if let Some(keys) = price_contested.write().as_mut() {
@@ -413,13 +629,13 @@ impl PaidList {
                 }
                 drop(ordered);
 
-                Ok(true)
+                Ok(Some(value))
             })
             .await
             .map_err(|e| Error::Storage(format!("Paid-list insert task failed: {e}")))?
             .map_err(|e| self.insert_error(&e))?;
 
-        if was_new {
+        if let Some(value) = written {
             debug!(
                 "Added key {} to paid-list{}",
                 hex::encode(key),
@@ -431,7 +647,46 @@ impl PaidList {
             );
         }
 
-        Ok(was_new)
+        Ok(written.is_some())
+    }
+
+    /// Keep, across restarts, that this node refused on price a verified
+    /// payment for the chunk at `key` (ADR-0006), so the first paid-list
+    /// record of `key` it writes from then on, by any path, repair included,
+    /// is marked: it judges no peer on a write it refused. An entry the key
+    /// already has stays exactly as it is, as for any later payment.
+    ///
+    /// The refusal never makes `key` paid: it is kept apart from the paid
+    /// set, so no check, count, hint or vote reads it. Removing or evicting
+    /// the key's paid entry leaves it, so the key comes back marked. Once the
+    /// store holds [`PRICE_REFUSALS_CAP`] addresses, a new one saturates it
+    /// instead: from then on every new record is marked, across restarts.
+    ///
+    /// Committed before this returns, under the same write order as every
+    /// paid-list write, on a blocking task that `wait_idle` waits for, so a
+    /// dropped caller still commits it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the refusal could not be committed. The store is
+    /// then in doubt: until the node restarts, every new record is marked.
+    pub async fn record_price_refusal(&self, key: &XorName) -> Result<()> {
+        let key_owned = *key;
+        let refusals = self.refusals.clone();
+        let write_order = Arc::clone(&self.write_order);
+        self.blocking_tracker
+            .spawn_blocking(move || -> heed::Result<()> {
+                let ordered = write_order.lock();
+                let recorded = refusals.record(&key_owned);
+                if let Err(e) = &recorded {
+                    refusals.doubt(e);
+                }
+                drop(ordered);
+                recorded
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("Price-refusal task failed: {e}")))?
+            .map_err(|e| Error::Storage(format!("Failed to record a price refusal: {e}")))
     }
 
     /// Whether `key` is paid at a price the floor contested here (see
@@ -872,16 +1127,34 @@ impl PaidList {
     pub(crate) fn test_removals_committing(&self) -> u64 {
         self.test_removals_committing.load(Ordering::Acquire)
     }
+
+    /// Test-only: make the price-refusal store hit `faults` from now on
+    /// ([`FAIL_PRICE_REFUSAL_WRITES`], [`FAIL_PRICE_REFUSAL_READS`]).
+    #[cfg(test)]
+    pub(crate) fn set_price_refusal_faults_for_tests(&self, faults: u8) {
+        self.refusals.faults.store(faults, Ordering::Release);
+    }
+
+    /// Test-only: every entry the price-refusal store holds, the saturated
+    /// one included.
+    #[cfg(test)]
+    pub(crate) fn price_refusal_entries_for_tests(&self) -> heed::Result<u64> {
+        let rtxn = self.refusals.env.read_txn()?;
+        self.refusals.db.len(&rtxn)
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use std::fmt::Debug;
     #[cfg(target_pointer_width = "64")]
     use std::fs::OpenOptions;
     #[cfg(target_pointer_width = "64")]
     use std::io::{Read, Seek, SeekFrom, Write};
+    use std::pin::Pin;
+    use std::sync::mpsc as std_mpsc;
     use tokio::sync::oneshot;
     use tokio::task::JoinHandle;
     #[cfg(feature = "logging")]
@@ -897,6 +1170,8 @@ mod tests {
     const WAIT_IDLE_BLOCKED_PROBE: std::time::Duration = std::time::Duration::from_millis(200);
     /// Generous ceiling for `wait_idle` to complete once the op is released.
     const WAIT_IDLE_COMPLETE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    /// How often a test looks whether a write has taken the write order.
+    const WRITE_ORDER_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 
     /// The in-memory copy of the marks, which must have been read on open.
     fn marked_in_memory(pl: &PaidList) -> HashSet<XorName> {
@@ -1718,7 +1993,15 @@ mod tests {
         tokio::sync::oneshot::Sender<()>,
         tokio::task::JoinHandle<()>,
     ) {
-        let env = pl.env.clone();
+        hold_env_write_txn(pl.env.clone()).await
+    }
+
+    /// [`hold_write_txn`] for the price-refusal env.
+    async fn hold_refusal_write_txn(pl: &PaidList) -> (oneshot::Sender<()>, JoinHandle<()>) {
+        hold_env_write_txn(pl.refusals.env.clone()).await
+    }
+
+    async fn hold_env_write_txn(env: Env) -> (oneshot::Sender<()>, JoinHandle<()>) {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
         let (opened_tx, opened_rx) = tokio::sync::oneshot::channel::<()>();
         let holder = tokio::task::spawn_blocking(move || {
@@ -1830,6 +2113,383 @@ mod tests {
 
         // The paid list remains usable after wait_idle (tracker reopened).
         assert!(pl.insert(&key_a).await.expect("insert after wait_idle"));
+    }
+
+    // -- Price refusals (ADR-0006) ---------------------------------------------
+
+    /// A price refusal is no paid entry, and the first record of its key is
+    /// marked, whichever insert writes it. A key never refused is not.
+    #[tokio::test]
+    async fn a_price_refusal_marks_the_first_record_of_its_key_and_is_not_paid() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let refused: XorName = [0x81; 32];
+        let refused_then_marked: XorName = [0x82; 32];
+        let clean: XorName = [0x83; 32];
+
+        pl.record_price_refusal(&refused).await.expect("refusal");
+        pl.record_price_refusal(&refused_then_marked)
+            .await
+            .expect("refusal");
+        assert!(!pl.contains(&refused).expect("contains"));
+        assert_eq!(pl.count().expect("count"), 0);
+
+        assert!(pl.insert(&refused).await.expect("insert"));
+        assert!(pl
+            .insert_price_contested(&refused_then_marked)
+            .await
+            .expect("insert"));
+        assert!(pl.insert(&clean).await.expect("insert"));
+        assert!(pl.is_price_contested(&refused).expect("read mark"));
+        assert!(pl
+            .is_price_contested(&refused_then_marked)
+            .expect("read mark"));
+        assert!(!pl.is_price_contested(&clean).expect("read mark"));
+        assert_eq!(
+            marked_in_memory(&pl),
+            HashSet::from([refused, refused_then_marked])
+        );
+    }
+
+    /// The first record of a key decides its mark: a later refusal leaves an
+    /// existing entry, plain or marked, as it is.
+    #[tokio::test]
+    async fn a_price_refusal_leaves_an_existing_entry_as_it_is() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let plain: XorName = [0x84; 32];
+        let marked: XorName = [0x85; 32];
+        pl.insert(&plain).await.expect("insert");
+        pl.insert_price_contested(&marked).await.expect("insert");
+
+        pl.record_price_refusal(&plain).await.expect("refusal");
+        pl.record_price_refusal(&marked).await.expect("refusal");
+        assert!(!pl.insert(&plain).await.expect("insert again"));
+
+        assert!(!pl.is_price_contested(&plain).expect("read mark"));
+        assert!(pl.is_price_contested(&marked).expect("read mark"));
+    }
+
+    /// A refusal survives a restart, and the removal of its key's entry by a
+    /// single or a batch removal, the path eviction takes: the key comes back
+    /// marked.
+    #[tokio::test]
+    async fn a_price_refusal_survives_a_restart_and_the_removal_of_its_entry() {
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let removed: XorName = [0x86; 32];
+        let batch_removed: XorName = [0x87; 32];
+        let clean: XorName = [0x88; 32];
+        {
+            let pl = PaidList::new(temp_dir.path()).await.expect("open");
+            pl.record_price_refusal(&removed).await.expect("refusal");
+            pl.record_price_refusal(&batch_removed)
+                .await
+                .expect("refusal");
+            pl.wait_idle().await;
+        }
+
+        let pl = PaidList::new(temp_dir.path()).await.expect("reopen");
+        for key in [removed, batch_removed, clean] {
+            assert!(pl.insert(&key).await.expect("insert"));
+        }
+        assert!(pl.is_price_contested(&removed).expect("read mark"));
+        assert!(pl.is_price_contested(&batch_removed).expect("read mark"));
+        assert!(!pl.is_price_contested(&clean).expect("read mark"));
+
+        assert!(pl.remove(&removed).await.expect("remove"));
+        assert_eq!(pl.remove_batch(&[batch_removed]).await.expect("batch"), 1);
+        assert!(pl.insert(&removed).await.expect("insert again"));
+        assert!(pl.insert(&batch_removed).await.expect("insert again"));
+        assert!(pl.is_price_contested(&removed).expect("read mark"));
+        assert!(pl.is_price_contested(&batch_removed).expect("read mark"));
+    }
+
+    /// The store keeps `cap` addresses. A repeated one costs nothing; a new
+    /// one past the cap saturates it instead, and from then on, across a
+    /// restart, every new record is marked. Existing entries stay as they
+    /// are.
+    #[tokio::test]
+    async fn the_price_refusal_store_saturates_past_its_cap_across_a_restart() {
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let (first, second, past_cap) = ([0x89; 32], [0x8A; 32], [0x8B; 32]);
+        let (older, at_cap, unrelated, after_restart) =
+            ([0x8C; 32], [0x8D; 32], [0x8E; 32], [0x8F; 32]);
+        {
+            let pl = PaidList::with_refusal_cap(temp_dir.path(), 2)
+                .await
+                .expect("open");
+            pl.insert(&older).await.expect("insert");
+            for key in [first, second, first] {
+                pl.record_price_refusal(&key).await.expect("refusal");
+            }
+            assert_eq!(pl.price_refusal_entries_for_tests().expect("count"), 2);
+            pl.insert(&at_cap).await.expect("insert");
+            assert!(!pl.is_price_contested(&at_cap).expect("read mark"));
+
+            pl.record_price_refusal(&past_cap).await.expect("refusal");
+            assert_eq!(pl.price_refusal_entries_for_tests().expect("count"), 3);
+            pl.insert(&unrelated).await.expect("insert");
+            assert!(pl.is_price_contested(&unrelated).expect("read mark"));
+            pl.wait_idle().await;
+        }
+
+        // Read back before anything is written: the reopened store must know
+        // it is saturated from the disk alone.
+        let pl = PaidList::with_refusal_cap(temp_dir.path(), 2)
+            .await
+            .expect("reopen");
+        pl.insert(&after_restart).await.expect("insert");
+        assert!(pl.is_price_contested(&after_restart).expect("read mark"));
+        assert!(!pl.is_price_contested(&older).expect("read mark"));
+        assert!(!pl.is_price_contested(&at_cap).expect("read mark"));
+        pl.record_price_refusal(&[0x90; 32]).await.expect("refusal");
+        assert_eq!(pl.price_refusal_entries_for_tests().expect("count"), 3);
+    }
+
+    /// A refusal that saturates the store but cannot commit leaves it as it
+    /// was on disk: in doubt until the restart, then not saturated.
+    #[tokio::test]
+    async fn a_saturation_that_cannot_commit_is_not_kept() {
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let (kept, past_cap, in_doubt, after_restart) =
+            ([0x9B; 32], [0x9C; 32], [0x9D; 32], [0x9E; 32]);
+        {
+            let pl = PaidList::with_refusal_cap(temp_dir.path(), 1)
+                .await
+                .expect("open");
+            pl.record_price_refusal(&kept).await.expect("refusal");
+            pl.set_price_refusal_faults_for_tests(FAIL_PRICE_REFUSAL_WRITES);
+            assert!(pl.record_price_refusal(&past_cap).await.is_err());
+            // Not saturated, so the next refusal still tries to commit, and
+            // fails, rather than passing for kept.
+            assert!(!pl.refusals.saturated.load(Ordering::Acquire));
+            assert!(pl.record_price_refusal(&[0x9F; 32]).await.is_err());
+            pl.insert(&in_doubt).await.expect("insert");
+            assert!(pl.is_price_contested(&in_doubt).expect("read mark"));
+            pl.wait_idle().await;
+        }
+
+        let pl = PaidList::with_refusal_cap(temp_dir.path(), 1)
+            .await
+            .expect("reopen");
+        assert_eq!(pl.price_refusal_entries_for_tests().expect("count"), 1);
+        pl.insert(&after_restart).await.expect("insert");
+        assert!(!pl.is_price_contested(&after_restart).expect("read mark"));
+    }
+
+    /// A refusal that cannot be committed is an error, and puts the store in
+    /// doubt: every new record is marked until a restart, even after a later
+    /// refusal commits. Existing entries stay as they are.
+    #[tokio::test]
+    async fn a_failed_price_refusal_marks_every_new_record_until_restart() {
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let (older, lost, kept) = ([0x91; 32], [0x92; 32], [0x93; 32]);
+        let (unrelated, after_restart) = ([0x94; 32], [0x95; 32]);
+        {
+            let pl = PaidList::new(temp_dir.path()).await.expect("open");
+            pl.insert(&older).await.expect("insert");
+            pl.set_price_refusal_faults_for_tests(FAIL_PRICE_REFUSAL_WRITES);
+            assert!(pl.record_price_refusal(&lost).await.is_err());
+            pl.set_price_refusal_faults_for_tests(0);
+            pl.record_price_refusal(&kept).await.expect("refusal");
+
+            pl.insert(&unrelated).await.expect("insert");
+            assert!(pl.is_price_contested(&unrelated).expect("read mark"));
+            assert!(!pl.insert(&older).await.expect("insert again"));
+            assert!(!pl.is_price_contested(&older).expect("read mark"));
+            pl.wait_idle().await;
+        }
+
+        let pl = PaidList::new(temp_dir.path()).await.expect("reopen");
+        pl.insert(&after_restart).await.expect("insert");
+        assert!(!pl.is_price_contested(&after_restart).expect("read mark"));
+        pl.insert(&kept).await.expect("insert");
+        assert!(pl.is_price_contested(&kept).expect("read mark"));
+    }
+
+    /// A refusal store that cannot be read marks the record, and stays in
+    /// doubt once reads succeed again.
+    #[tokio::test]
+    async fn an_unreadable_price_refusal_store_marks_every_new_record() {
+        let (pl, _temp) = create_test_paid_list().await;
+        pl.set_price_refusal_faults_for_tests(FAIL_PRICE_REFUSAL_READS);
+        pl.insert(&[0x96; 32]).await.expect("insert");
+        assert!(pl.is_price_contested(&[0x96; 32]).expect("read mark"));
+
+        pl.set_price_refusal_faults_for_tests(0);
+        pl.insert(&[0x97; 32]).await.expect("insert");
+        assert!(pl.is_price_contested(&[0x97; 32]).expect("read mark"));
+    }
+
+    /// Return once a blocking task holds the paid list's write order, the
+    /// only lock the test does not take itself. Panics if none takes it in
+    /// time.
+    async fn write_order_taken(pl: &PaidList) {
+        let held = async {
+            while pl.write_order.try_lock().is_some() {
+                tokio::time::sleep(WRITE_ORDER_POLL).await;
+            }
+        };
+        tokio::time::timeout(WAIT_IDLE_COMPLETE_TIMEOUT, held)
+            .await
+            .expect("a write takes the write order");
+    }
+
+    /// Drive `write` until its blocking task holds the write order. Panics if
+    /// `write` finishes first.
+    async fn until_write_order_is_held<F>(pl: &PaidList, write: &mut Pin<&mut F>)
+    where
+        F: Future,
+        F::Output: Debug,
+    {
+        tokio::select! {
+            output = write.as_mut() => panic!("the write must be parked, got {output:?}"),
+            () = write_order_taken(pl) => {}
+        }
+    }
+
+    /// A failing refusal puts the store in doubt itself, under the write
+    /// order, so a dropped caller cannot lose that: the first record that
+    /// waited behind it is marked.
+    #[tokio::test]
+    async fn a_failed_refusal_whose_caller_was_dropped_still_puts_the_store_in_doubt() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let (dropped, unrelated): (XorName, XorName) = ([0xA0; 32], [0xA1; 32]);
+        pl.set_price_refusal_faults_for_tests(FAIL_PRICE_REFUSAL_WRITES);
+        let (release, holder) = hold_refusal_write_txn(&pl).await;
+        tokio::select! {
+            biased;
+            res = pl.record_price_refusal(&dropped) => {
+                panic!("the refusal must be parked on its writer slot, got {res:?}")
+            }
+            () = std::future::ready(()) => {}
+        }
+        write_order_taken(&pl).await;
+
+        let record = pl.insert(&unrelated);
+        tokio::pin!(record);
+        let parked = tokio::time::timeout(WAIT_IDLE_BLOCKED_PROBE, &mut record).await;
+        assert!(parked.is_err(), "the record waits for the refusal");
+        drop(release);
+        holder.await.expect("holder task");
+        assert!(record.await.expect("insert"));
+        assert!(pl.is_price_contested(&unrelated).expect("read mark"));
+    }
+
+    /// A first record's look at the refusal store takes no LMDB reader slot,
+    /// which a blocking-pool thread would keep for as long as it lives: with
+    /// every slot held by other threads, a lookup from a thread that never
+    /// had one finds a clean key clean, and does not put the store in doubt.
+    #[tokio::test]
+    async fn a_price_refusal_lookup_takes_no_reader_slot() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let mut readers = Vec::new();
+        loop {
+            let env = pl.refusals.env.clone();
+            let (opened_tx, opened_rx) = std_mpsc::channel::<bool>();
+            let (release_tx, release_rx) = std_mpsc::channel::<()>();
+            let reader = std::thread::spawn(move || {
+                let rtxn = env.read_txn();
+                let _ = opened_tx.send(rtxn.is_ok());
+                let _ = release_rx.recv();
+                drop(rtxn);
+            });
+            readers.push((release_tx, reader));
+            if !opened_rx.recv().expect("reader reports") {
+                break;
+            }
+            assert!(readers.len() < 1_024, "the reader table never filled");
+        }
+
+        let clean: XorName = [0xA2; 32];
+        let refusals = pl.refusals.clone();
+        let marks = std::thread::spawn(move || refusals.marks(&clean))
+            .join()
+            .expect("lookup thread");
+        assert!(
+            !marks,
+            "a full reader table must not put the store in doubt"
+        );
+        pl.insert(&clean).await.expect("insert");
+        for (release_tx, reader) in readers {
+            drop(release_tx);
+            reader.join().expect("reader thread");
+        }
+        assert!(!pl.is_price_contested(&clean).expect("read mark"));
+    }
+
+    /// A refusal and a first record of its key never interleave. A refusal
+    /// under way holds back the record, which comes out marked. A record under
+    /// way holds back the refusal, and stays plain; the refusal still marks
+    /// the key's next first record.
+    #[tokio::test]
+    async fn a_price_refusal_and_a_first_record_are_serialised() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let refused_first: XorName = [0x98; 32];
+        let recorded_first: XorName = [0x99; 32];
+
+        let (release, holder) = hold_refusal_write_txn(&pl).await;
+        let refusal = pl.record_price_refusal(&refused_first);
+        tokio::pin!(refusal);
+        until_write_order_is_held(&pl, &mut refusal).await;
+        let record = pl.insert(&refused_first);
+        tokio::pin!(record);
+        let parked = tokio::time::timeout(WAIT_IDLE_BLOCKED_PROBE, &mut record).await;
+        assert!(parked.is_err(), "the record waits for the refusal");
+        drop(release);
+        holder.await.expect("holder task");
+        refusal.await.expect("refusal");
+        assert!(record.await.expect("insert"));
+        assert!(pl.is_price_contested(&refused_first).expect("read mark"));
+
+        let (release, holder) = hold_write_txn(&pl).await;
+        let record = pl.insert(&recorded_first);
+        tokio::pin!(record);
+        until_write_order_is_held(&pl, &mut record).await;
+        let refusal = pl.record_price_refusal(&recorded_first);
+        tokio::pin!(refusal);
+        let parked = tokio::time::timeout(WAIT_IDLE_BLOCKED_PROBE, &mut refusal).await;
+        assert!(parked.is_err(), "the refusal waits for the record");
+        drop(release);
+        holder.await.expect("holder task");
+        assert!(record.await.expect("insert"));
+        refusal.await.expect("refusal");
+        assert!(!pl.is_price_contested(&recorded_first).expect("read mark"));
+
+        assert!(pl.remove(&recorded_first).await.expect("remove"));
+        assert!(pl.insert(&recorded_first).await.expect("insert again"));
+        assert!(pl.is_price_contested(&recorded_first).expect("read mark"));
+    }
+
+    /// Dropping a refusal's caller does not cancel its commit: `wait_idle`
+    /// waits for it, and the refusal is there after a restart.
+    #[tokio::test]
+    async fn wait_idle_waits_for_a_price_refusal_whose_caller_was_dropped() {
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let key: XorName = [0x9A; 32];
+        {
+            let pl = PaidList::new(temp_dir.path()).await.expect("open");
+            let (release, holder) = hold_refusal_write_txn(&pl).await;
+            tokio::select! {
+                biased;
+                res = pl.record_price_refusal(&key) => {
+                    panic!("the refusal must be parked on its writer slot, got {res:?}")
+                }
+                () = std::future::ready(()) => {}
+            }
+            let blocked = tokio::time::timeout(WAIT_IDLE_BLOCKED_PROBE, pl.wait_idle()).await;
+            assert!(
+                blocked.is_err(),
+                "wait_idle returned while the refusal was parked"
+            );
+            drop(release);
+            holder.await.expect("holder task");
+            tokio::time::timeout(WAIT_IDLE_COMPLETE_TIMEOUT, pl.wait_idle())
+                .await
+                .expect("wait_idle after release");
+        }
+
+        let pl = PaidList::new(temp_dir.path()).await.expect("reopen");
+        pl.insert(&key).await.expect("insert");
+        assert!(pl.is_price_contested(&key).expect("read mark"));
     }
 
     // -- Scenario tests -------------------------------------------------------

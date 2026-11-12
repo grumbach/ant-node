@@ -14,6 +14,7 @@ use crate::payment::proof::{
 use crate::replication::commitment::MAX_COMMITMENT_KEY_COUNT;
 use crate::replication::commitment_state::GOSSIP_ANSWERABILITY_TTL;
 use crate::replication::config::K_BUCKET_SIZE;
+use crate::replication::paid_list::PaidList;
 use crate::storage::ChunkStore;
 use ant_protocol::payment::verify::{verify_quote_content, verify_quote_signature};
 use evmlib::common::{Amount, QuoteHash};
@@ -30,7 +31,7 @@ use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Instant, SystemTime};
 
 /// Minimum allowed size for a payment proof in bytes.
@@ -766,10 +767,17 @@ pub struct PaymentVerifier {
     /// refused payments enter. An admitted chunk is recorded within moments of
     /// its verification, so the fixed [`PRICE_CONTESTED_MEMORY_CAPACITY`],
     /// whatever the payment cache is sized to, loses that decision before it
-    /// is read only if that many newer such payments arrive in between. A
-    /// refused one may be read much later, when repair verification records
-    /// the key, so it lasts only until that many newer ones, or a restart.
+    /// is read only if that many newer such payments arrive in between, or
+    /// the node restarts. A refused one may be read much later, when repair
+    /// verification records
+    /// the key, so the paid list also keeps it, across restarts and however
+    /// many newer payments arrive (see [`Self::keep_price_refusal`]).
     verified_price_contested: Mutex<LruCache<XorName, ()>>,
+    /// ADR-0006: the paid list that keeps this node's price refusals across
+    /// restarts (see [`PaidList::record_price_refusal`]), once
+    /// [`Self::attach_paid_list`] has run. Held weakly, so this verifier never
+    /// keeps the list open after the replication engine has dropped it.
+    paid_list: RwLock<Option<Weak<PaidList>>>,
     /// Configuration.
     config: PaymentVerifierConfig,
 }
@@ -912,8 +920,43 @@ impl PaymentVerifier {
             )),
             merkle_parity_emissions: std::sync::atomic::AtomicUsize::new(0),
             verified_price_contested,
+            paid_list: RwLock::new(None),
             config,
         }
+    }
+
+    /// Attach the replication engine's paid list, which keeps the chunk
+    /// payments this verifier refuses on price across restarts (ADR-0006).
+    ///
+    /// The engine attaches it as soon as it opens the list, before the floor
+    /// can refuse anything: the floor prices nothing until the node's own
+    /// commitment source is attached, which needs the engine. Held weakly
+    /// (see the field). Idempotent: calling twice replaces it.
+    pub fn attach_paid_list(&self, paid_list: &Arc<PaidList>) {
+        *self.paid_list.write() = Some(Arc::downgrade(paid_list));
+        debug!("PaymentVerifier: paid list attached for price refusals");
+    }
+
+    /// Keep this verifier's refusal of the chunk payment at `address` in the
+    /// attached paid list (see [`PaidList::record_price_refusal`]). A verifier
+    /// never given one has nothing to keep it in, and keeps it in memory only.
+    ///
+    /// # Errors
+    ///
+    /// A storage error, reported instead of the refusal, if the refusal could
+    /// not be kept: its commit failed, or the paid list has closed. Either
+    /// way the write is still not admitted.
+    async fn keep_price_refusal(&self, address: &XorName) -> Result<()> {
+        let attached = self.paid_list.read().clone();
+        let Some(attached) = attached else {
+            return Ok(());
+        };
+        let Some(paid_list) = attached.upgrade() else {
+            return Err(Error::Storage(
+                "A price refusal could not be kept: the paid list has closed".to_string(),
+            ));
+        };
+        paid_list.record_price_refusal(address).await
     }
 
     /// Attach the ADR-0004 monetized-pin sender (the replication engine's
@@ -1026,7 +1069,9 @@ impl PaymentVerifier {
     /// the price floor contested, admitted or refused: a node judges no peer
     /// on a write it refused on price either, however it later records it.
     /// Held in memory only, so a restart, or 100,000 newer such payments,
-    /// forget it.
+    /// forget it. A refusal is also kept by the paid list, which marks the
+    /// key's first record whatever this says (see
+    /// [`PaidList::record_price_refusal`]).
     ///
     /// Unlike [`Self::price_contested`], this only ever reflects a proof whose
     /// signature and settlement this node checked: a write admitted later from
@@ -2078,12 +2123,14 @@ impl PaymentVerifier {
         );
 
         if below_floor {
-            // Remembered as a contested admission is, so a later record of the
-            // chunk on this node, from a payment that clears the floor or from
-            // repair, judges no peer on a write this node refused on price
-            // (see `verified_payment_contested`).
+            // Kept, so that a later record of the chunk on this node, from a
+            // payment that clears the floor or from repair, judges no peer on a
+            // write this node refused on price: in the paid list's refusal
+            // store across restarts, before the refusal is reported, and in
+            // the contested memory as an admission is.
             if let PaymentTarget::Chunk(address) = target {
                 self.verified_price_contested.lock().put(*address, ());
+                self.keep_price_refusal(address).await?;
             }
             return Err(Error::Payment(format!(
                 "Settled payment {settled_amount} is below the close-group price floor \
@@ -3937,6 +3984,8 @@ impl PaymentVerifier {
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::replication::fresh::record_repair_verified_keys;
+    use crate::replication::paid_list::FAIL_PRICE_REFUSAL_WRITES;
     use evmlib::merkle_payments::MerklePaymentCandidatePool;
     use evmlib::PaymentQuote;
     use saorsa_core::MlDsa65;
@@ -5528,6 +5577,199 @@ mod tests {
             .await
             .expect_err("a filled view refuses a baseline payment");
         assert!(verifier.verified_payment_contested(&xorname));
+    }
+
+    /// Have `verifier` refuse a baseline payment for the chunk at `xorname`
+    /// on its full close-group view, and return the error.
+    async fn refuse_baseline_payment(
+        verifier: &PaymentVerifier,
+        xorname: XorName,
+        neighbours: &[[u8; 32]],
+        context: VerificationContext,
+    ) -> Error {
+        let proof_bytes = group_floor_proof(
+            verifier,
+            xorname,
+            0,
+            three_times(price_at_records(0)),
+            neighbours,
+        );
+        verifier
+            .verify_payment(&xorname, Some(&proof_bytes), context)
+            .await
+            .expect_err("a full view refuses a baseline payment")
+    }
+
+    /// ADR-0006: a chunk payment refused on price, in every context, is kept
+    /// across a restart, as no paid entry, so repair on a verifier that has
+    /// forgotten it still records the key marked.
+    #[tokio::test]
+    async fn a_price_refusal_is_kept_across_a_restart_in_every_context() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let refused = [[0xF1u8; 32], [0xF2u8; 32], [0xF3u8; 32]];
+        let clean = [0xF4u8; 32];
+        {
+            let paid_list = Arc::new(PaidList::new(temp_dir.path()).await.expect("paid list"));
+            for (xorname, context) in refused.into_iter().zip([
+                VerificationContext::ClientPut,
+                VerificationContext::FreshReplication,
+                VerificationContext::PaidListAdmission,
+            ]) {
+                let verifier = floor_test_verifier();
+                verifier.attach_paid_list(&paid_list);
+                let neighbours =
+                    attach_group_commitments(&verifier, &GROUP_TEST_KEY_COUNTS, Duration::ZERO);
+                let err = refuse_baseline_payment(&verifier, xorname, &neighbours, context).await;
+                assert!(
+                    format!("{err}").contains("below the close-group price floor"),
+                    "{context:?}: {err}"
+                );
+                assert!(!paid_list.contains(&xorname).expect("contains"));
+            }
+            paid_list.wait_idle().await;
+        }
+
+        let paid_list = PaidList::new(temp_dir.path()).await.expect("reopen");
+        let forgetful = floor_test_verifier();
+        let mut repaired = refused.to_vec();
+        repaired.push(clean);
+        record_repair_verified_keys(&repaired, &forgetful, &paid_list).await;
+        for xorname in &refused {
+            assert!(paid_list.is_price_contested(xorname).expect("read mark"));
+        }
+        assert!(!paid_list.is_price_contested(&clean).expect("read mark"));
+    }
+
+    /// A refusal outlives the verifier's memory of it: 100,000 newer
+    /// contested payments push it out, and repair still records the key
+    /// marked.
+    #[tokio::test]
+    async fn a_price_refusal_outlives_the_contested_memory() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let paid_list = Arc::new(PaidList::new(temp_dir.path()).await.expect("paid list"));
+        let verifier = floor_test_verifier();
+        verifier.attach_paid_list(&paid_list);
+        let neighbours =
+            attach_group_commitments(&verifier, &GROUP_TEST_KEY_COUNTS, Duration::ZERO);
+        let xorname = [0xF5u8; 32];
+        refuse_baseline_payment(
+            &verifier,
+            xorname,
+            &neighbours,
+            VerificationContext::ClientPut,
+        )
+        .await;
+
+        for index in 0..PRICE_CONTESTED_MEMORY_CAPACITY {
+            let mut newer = [0u8; 32];
+            let index = u64::try_from(index).expect("index fits");
+            newer[..8].copy_from_slice(&index.to_be_bytes());
+            verifier.note_contested_admission_for_tests(&newer);
+        }
+        assert!(!verifier.verified_payment_contested(&xorname));
+
+        record_repair_verified_keys(&[xorname], &verifier, &paid_list).await;
+        assert!(paid_list.is_price_contested(&xorname).expect("read mark"));
+    }
+
+    /// Only a chunk payment the floor refused is kept. A pointer refused on
+    /// price, and a chunk proof that fails before the floor (here: never
+    /// settled), leave nothing that marks a later record.
+    #[tokio::test]
+    async fn only_a_chunk_payment_refused_on_price_is_kept() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let paid_list = Arc::new(PaidList::new(temp_dir.path()).await.expect("paid list"));
+        let verifier = floor_test_verifier();
+        verifier.attach_paid_list(&paid_list);
+        let neighbours =
+            attach_group_commitments(&verifier, &GROUP_TEST_KEY_COUNTS, Duration::ZERO);
+
+        let (address, state_id) = ([0xF6u8; 32], [0xF7u8; 32]);
+        let cheap_proof = group_floor_proof(
+            &verifier,
+            state_id,
+            GROUP_TEST_NEAR_EMPTY_KEY_COUNT,
+            three_times(price_at_records(GROUP_TEST_NEAR_EMPTY_KEY_COUNT)),
+            &neighbours,
+        );
+        let err = verifier
+            .verify_pointer_payment_in(
+                &address,
+                &state_id,
+                &cheap_proof,
+                VerificationContext::ClientPut,
+            )
+            .await
+            .expect_err("a near-empty quoter is refused for a pointer");
+        assert!(format!("{err}").contains("below the close-group price floor"));
+
+        let unsettled = [0xF8u8; 32];
+        let unsettled_proof = group_floor_proof(&verifier, unsettled, 0, Amount::ZERO, &neighbours);
+        let refused = verifier
+            .verify_payment(
+                &unsettled,
+                Some(&unsettled_proof),
+                VerificationContext::ClientPut,
+            )
+            .await
+            .map_or_else(|e| e.to_string(), |status| format!("{status:?}"));
+        assert!(refused.contains("not paid enough"), "{refused}");
+
+        for key in [address, state_id, unsettled] {
+            assert!(paid_list.insert(&key).await.expect("insert"));
+            assert!(!paid_list.is_price_contested(&key).expect("read mark"));
+        }
+    }
+
+    /// A refusal this node could not keep is a storage error, not a price
+    /// refusal: its commit failed, or the paid list has closed. The verifier
+    /// holds the list weakly, so it never keeps it open. A verifier never
+    /// given a paid list refuses on price as before.
+    #[tokio::test]
+    async fn a_price_refusal_this_node_could_not_keep_is_a_storage_error() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let paid_list = Arc::new(PaidList::new(temp_dir.path()).await.expect("paid list"));
+        let verifier = floor_test_verifier();
+        verifier.attach_paid_list(&paid_list);
+        let neighbours =
+            attach_group_commitments(&verifier, &GROUP_TEST_KEY_COUNTS, Duration::ZERO);
+
+        paid_list.set_price_refusal_faults_for_tests(FAIL_PRICE_REFUSAL_WRITES);
+        let err = refuse_baseline_payment(
+            &verifier,
+            [0xF9u8; 32],
+            &neighbours,
+            VerificationContext::ClientPut,
+        )
+        .await;
+        assert!(matches!(err, Error::Storage(_)), "{err}");
+
+        paid_list.wait_idle().await;
+        drop(paid_list);
+        let reopened = PaidList::new(temp_dir.path())
+            .await
+            .expect("the verifier must not keep the paid list open");
+        let err = refuse_baseline_payment(
+            &verifier,
+            [0xFAu8; 32],
+            &neighbours,
+            VerificationContext::ClientPut,
+        )
+        .await;
+        assert!(matches!(err, Error::Storage(_)), "{err}");
+        drop(reopened);
+
+        let unattached = floor_test_verifier();
+        let neighbours =
+            attach_group_commitments(&unattached, &GROUP_TEST_KEY_COUNTS, Duration::ZERO);
+        let err = refuse_baseline_payment(
+            &unattached,
+            [0xFBu8; 32],
+            &neighbours,
+            VerificationContext::ClientPut,
+        )
+        .await;
+        assert!(matches!(err, Error::Payment(_)), "{err}");
     }
 
     /// A routing view of one key for the sample-fill tests, nearest first,

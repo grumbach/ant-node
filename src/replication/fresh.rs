@@ -103,7 +103,9 @@ impl AsRef<[u8]> for EncodedOffer {
 /// scores no one. Every other check that reads the mark points here.
 ///
 /// The first record of a key decides its mark: an existing entry is never
-/// changed, so a later payment can neither add nor remove it. Returns whether
+/// changed, so a later payment can neither add nor remove it. A first record
+/// of a key this node refused a payment for on price is marked whatever
+/// `mark` says (see `PaidList::record_price_refusal`). Returns whether
 /// `mark` or the key's record is marked once this call is done, whichever
 /// record won: ours, or one a concurrent `PaidNotify` or fresh offer wrote
 /// first. A mark that cannot be read counts as set (see
@@ -125,11 +127,11 @@ pub(crate) async fn record_paid_key(key: &XorName, mark: bool, paid_list: &PaidL
 /// decision for it (see [`record_paid_key`]).
 ///
 /// Repair carries no proof to price. A key is therefore marked when this
-/// node's verifier remembers contesting or refusing a payment for it, so a
-/// node that refused a write on price and later records it because its
-/// group's votes authorised it still judges no peer on it. The memory does not
-/// survive a restart: a key repaired after one is recorded plainly, as every
-/// repaired key was before.
+/// node refused a payment for it on price, which the paid list keeps across
+/// restarts (see `PaidList::record_price_refusal`), or when its verifier still
+/// remembers contesting an admitted one. So a node that refused a write on
+/// price and later records it because its group's votes authorised it still
+/// judges no peer on it.
 pub(crate) async fn record_repair_verified_keys(
     keys: &[XorName],
     payment_verifier: &PaymentVerifier,

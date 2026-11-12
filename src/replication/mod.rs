@@ -1967,6 +1967,8 @@ impl ReplicationEngine {
                 .await
                 .map_err(|e| Error::Storage(format!("Failed to open PaidList: {e}")))?,
         );
+        // ADR-0006: before anything can give the floor a price to refuse on.
+        payment_verifier.attach_paid_list(&paid_list);
 
         let initial_neighbors = NeighborSyncState::new_cycle(Vec::new());
         let config = Arc::new(config);
