@@ -104,21 +104,39 @@ const PRICE_CONTESTED_MEMORY_CAPACITY: usize = 100_000;
 /// than the own-price reference it replaces until the sample is large: at 3
 /// neighbours it rejects 2.0% of honest stores, at 7 it rejects 0.6%, and only
 /// past about 11 does it beat the 0.377% the own-price floor measured in
-/// production. The gate therefore sits at 15 of the
-/// [`PAID_QUOTE_ISSUER_CLOSENESS_WIDTH`] closest, with the full table in
+/// production. The gate therefore sits at 15, with the full table in
 /// ADR-0006.
 ///
-/// Availability cost is small, and measured: on ant-prod-01 over
-/// 2026-10-14..20, 54 of 2,117 floor lines (2.6%) skipped, all `thin_sample`
-/// with 14 known neighbours; across all lines the median receiver knew 18.
-/// The sample is drawn from peers close to the CHUNK while the cache is filled
-/// from peers close to THIS NODE, so edge-of-range chunks skip more often. The
-/// `skipped=true` / `skip_reason` telemetry keeps measuring it.
+/// The sample is drawn first from the key's
+/// [`PAID_QUOTE_ISSUER_CLOSENESS_WIDTH`] closest, while the gossip cache is
+/// filled from peers close to THIS NODE, so a receiver at the edge of the
+/// key's group often knows fewer than 15 of them. On ant-prod-01 over
+/// 2026-10-14..20, 54 of 2,117 store-admission lines (2.6%) skipped, all
+/// `thin_sample`, 52 of them with 12 to 14 known neighbours; on a 990-node
+/// fleet run, 22.4% of paid-list admissions did. A paid-list admission's view
+/// is therefore filled from the key's next nearest peers up to
+/// [`PRICE_FLOOR_SAMPLE_WIDTH`], so it is priced on a sample of this size
+/// instead; a store admission's never is (see [`SampleReach::for_context`]).
+/// The `skipped=true` / `skip_reason` telemetry measures what is still left
+/// unpriced.
 ///
-/// A node that could suppress its neighbours' gossip can therefore disable this
-/// receiver's floor, but cannot make it reject honest traffic. That asymmetry is
-/// deliberate.
+/// A node that could suppress the gossip of enough of the key's nearest peers
+/// can therefore disable this receiver's floor, but cannot make it reject
+/// honest traffic. That asymmetry is deliberate.
 const PRICE_FLOOR_MIN_NEIGHBOUR_COMMITMENTS: usize = 15;
+
+/// How far down the key's closest peers, as this node's routing table ranks
+/// them, the price floor may reach to fill a sample that the key's own
+/// [`PAID_QUOTE_ISSUER_CLOSENESS_WIDTH`] closest leave short of
+/// [`PRICE_FLOOR_MIN_NEIGHBOUR_COMMITMENTS`].
+///
+/// A receiver at the edge of a key's group knows its own nearest neighbours,
+/// and those sit just past the key's 20th closest: a node among a key's 20
+/// closest has its own 20 closest within about twice that distance, the
+/// key's 40 closest. Sixty covers them with room for a cache that is not
+/// full, and bounds how far from the key the sample can reach, so it stays a
+/// price of the key's neighbourhood.
+const PRICE_FLOOR_SAMPLE_WIDTH: usize = 60;
 
 /// Why a price-floor evaluation did not produce a reference price.
 ///
@@ -168,13 +186,19 @@ struct FloorReference {
 
 /// What the price floor could see of the close group on one admission.
 ///
-/// `neighbours` is the quantity the gate actually tests; `total` includes this
-/// node's own commitment and is what the median is taken over. Both are logged
-/// because reporting only the total makes `group_sample=15, skipped=true` look
-/// like a contradiction when it is simply 14 neighbours plus self.
+/// `neighbours` counts the fresh neighbour commitments among the key's
+/// [`PAID_QUOTE_ISSUER_CLOSENESS_WIDTH`] closest; `filled` those taken from
+/// the next nearest peers because that was short of the gate (see
+/// [`PaymentVerifier::group_reference_price`]). The gate tests their sum.
+/// `total` adds this node's own commitment and is what the median is taken
+/// over. The line logs `neighbours` and `total`, so a filled view is the one
+/// where `total` exceeds `neighbours + 1`, and reporting only the total would
+/// make `group_sample=15, skipped=true` look like a contradiction when it is
+/// simply 14 neighbours plus self.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct GroupSample {
     neighbours: usize,
+    filled: usize,
     total: usize,
     skip_reason: Option<SkipReason>,
 }
@@ -183,6 +207,7 @@ impl GroupSample {
     const fn none(reason: SkipReason) -> Self {
         Self {
             neighbours: 0,
+            filled: 0,
             total: 0,
             skip_reason: Some(reason),
         }
@@ -200,6 +225,47 @@ impl GroupSample {
     #[cfg_attr(not(feature = "logging"), allow(dead_code))]
     fn skip_reason_str(self) -> &'static str {
         self.skip_reason.map_or("none", SkipReason::as_str)
+    }
+}
+
+/// How far past the key's close group the price floor's sample may reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SampleReach {
+    /// The key's [`PAID_QUOTE_ISSUER_CLOSENESS_WIDTH`] closest only.
+    CloseGroup,
+    /// The key's close group, filled from the next nearest peers up to rank
+    /// [`PRICE_FLOOR_SAMPLE_WIDTH`] when it is short of the gate (see
+    /// [`PaymentVerifier::group_reference_price`]).
+    Filled,
+}
+
+impl SampleReach {
+    /// The reach the floor samples with in `context`.
+    ///
+    /// Only a paid-list admission is filled. A peer that refuses a fresh offer
+    /// or a client PUT can be judged by a peer that stored the write, by its
+    /// possession check or its audits, and the contest margin that keeps a
+    /// refusal from becoming a penalty was only measured between views of
+    /// the key's close group. A refused `PaidNotify` is dropped and judged by
+    /// nobody, and refusing it is what keeps a below-floor write from the
+    /// paid-list votes that repair needs: that is where filling enforces the
+    /// floor at no risk to the refuser. It is also where views are thinnest,
+    /// since a `PaidNotify` reaches the key's whole paid close group.
+    const fn for_context(context: VerificationContext) -> Self {
+        match context {
+            VerificationContext::ClientPut | VerificationContext::FreshReplication => {
+                Self::CloseGroup
+            }
+            VerificationContext::PaidListAdmission => Self::Filled,
+        }
+    }
+
+    /// How many of the key's closest peers this reach looks at.
+    const fn width(self) -> usize {
+        match self {
+            Self::CloseGroup => PAID_QUOTE_ISSUER_CLOSENESS_WIDTH,
+            Self::Filled => PRICE_FLOOR_SAMPLE_WIDTH,
+        }
     }
 }
 
@@ -930,7 +996,9 @@ impl PaymentVerifier {
     /// misbehaviour (ADR-0006).
     ///
     /// True when the floor cannot price the write here (no own commitment, or
-    /// too thin a view), or when its paid price is below
+    /// too thin a view), when it priced it only on a view filled past the
+    /// key's close group (see [`Self::contested`]), or when its paid price is
+    /// below
     /// [`PRICE_FLOOR_CONTESTED_PERCENT`] of the UNCAPPED group median: the
     /// question is what a peer whose own price sits above this node's may have
     /// refused. The paid quote's price stands in for a third of the settled
@@ -946,7 +1014,9 @@ impl PaymentVerifier {
         let Some(paid_price) = Self::single_node_paid_price(proof) else {
             return false;
         };
-        let (reference, sample) = self.group_reference_price(routing).await;
+        let (reference, sample) = self
+            .group_reference_price(routing, SampleReach::CloseGroup)
+            .await;
         Self::contested(paid_price, reference, sample)
     }
 
@@ -971,18 +1041,27 @@ impl PaymentVerifier {
 
     /// The contest decision for a write paid at `paid_price`, from what the
     /// floor could price it against.
+    ///
+    /// Only a view of the key's own close group judges: a filled view (see
+    /// [`Self::group_reference_price`]) prices refusals, which the own-price
+    /// cap keeps safe on any sample, but the twofold contest margin was only
+    /// ever measured between views of the key's close group, so a write
+    /// priced on one is contested at any price.
     fn contested(
         paid_price: Amount,
         reference: Option<FloorReference>,
         sample: GroupSample,
     ) -> bool {
-        reference.map_or(
-            matches!(
+        match reference {
+            Some(reference) if sample.filled == 0 => {
+                paid_price < Self::contested_price(reference.group_median)
+            }
+            Some(_) => true,
+            None => matches!(
                 sample.skip_reason,
                 Some(SkipReason::NoOwnCommitment | SkipReason::ThinSample)
             ),
-            |reference| paid_price < Self::contested_price(reference.group_median),
-        )
+        }
     }
 
     /// The paid (median) quote's price in a single-node proof, or `None` for a
@@ -1682,16 +1761,23 @@ impl PaymentVerifier {
         )))
     }
 
-    /// The peer ids this node considers closest to `xorname`, by pure XOR
-    /// distance, mirroring the selection the paid-quote closeness check uses.
+    /// The `width` peers this node considers closest to `xorname`, nearest
+    /// first by pure XOR distance and this node included: the candidates the
+    /// price floor samples (see [`SampleReach::width`]). The first
+    /// [`PAID_QUOTE_ISSUER_CLOSENESS_WIDTH`] are the set the paid-quote
+    /// closeness check compares against (see
+    /// [`Self::validate_paid_quote_issuer_k_closest`]): the same sort, cut
+    /// shorter.
     ///
     /// Returns an empty vec when the node is not wired to the P2P layer, which
-    /// callers must treat as "no local view" rather than "no close peers".
-    async fn local_k_closest_peer_ids(&self, xorname: &XorName) -> Vec<PeerId> {
+    /// callers must treat as "no local view" rather than "no close peers". The
+    /// test override is read as a list already in distance order.
+    async fn floor_candidate_peer_ids(&self, xorname: &XorName, width: usize) -> Vec<PeerId> {
         #[cfg(any(test, feature = "test-utils"))]
-        if let Some(k_closest_peer_ids) = self.test_paid_quote_k_closest_override.read().as_ref() {
-            return k_closest_peer_ids
+        if let Some(ranked_peer_ids) = self.test_paid_quote_k_closest_override.read().as_ref() {
+            return ranked_peer_ids
                 .iter()
+                .take(width)
                 .map(|bytes| PeerId::from_bytes(*bytes))
                 .collect();
         }
@@ -1701,10 +1787,7 @@ impl PaymentVerifier {
         };
         p2p_node
             .dht_manager()
-            .find_closest_nodes_local_by_distance_with_self(
-                xorname,
-                PAID_QUOTE_ISSUER_CLOSENESS_WIDTH,
-            )
+            .find_closest_nodes_local_by_distance_with_self(xorname, width)
             .await
             .into_iter()
             .map(|node| node.peer_id)
@@ -1746,14 +1829,26 @@ impl PaymentVerifier {
     /// dropped, since gossip ingest authenticates the sender without bounding
     /// the count.
     ///
+    /// **The fill.** With [`SampleReach::Filled`], which a paid-list
+    /// admission uses, a sample that has fewer than
+    /// [`PRICE_FLOOR_MIN_NEIGHBOUR_COMMITMENTS`] of those K is filled from the
+    /// next nearest peers of `routing`, nearest first, up to rank
+    /// [`PRICE_FLOOR_SAMPLE_WIDTH`], and only to the gate: the gossip cache holds the peers close to this
+    /// node, so a receiver at the edge of the key's group knows its own side
+    /// of the key's neighbourhood rather than the far side. A view that was
+    /// already full is never filled, so it is priced exactly as before. A
+    /// filled reference refuses as any other does, and the cap holds on it
+    /// as on any sample; it never judges a peer (see [`Self::contested`]).
+    ///
     /// Returns a reference only when at least
     /// [`PRICE_FLOOR_MIN_NEIGHBOUR_COMMITMENTS`] neighbour commitments are
-    /// fresh AND this node has its own live commitment; the sample comes back
-    /// either way, so the caller can log how close it came. `None` means "do
-    /// not evaluate".
+    /// fresh, filled or not, AND this node has its own live commitment; the
+    /// sample comes back either way, so the caller can log how close it came.
+    /// `None` means "do not evaluate".
     async fn group_reference_price(
         &self,
         routing: &XorName,
+        reach: SampleReach,
     ) -> (Option<FloorReference>, GroupSample) {
         // This node's own live commitment. It is in the group whenever it is
         // being asked to store the data, so it belongs in the sample. Bound to
@@ -1772,8 +1867,8 @@ impl PaymentVerifier {
         };
         // Cache is checked first so a node without one does not pay for a
         // routing-table scan it will discard.
-        let closest = self.local_k_closest_peer_ids(routing).await;
-        if closest.is_empty() {
+        let candidates = self.floor_candidate_peer_ids(routing, reach.width()).await;
+        if candidates.is_empty() {
             return (None, GroupSample::none(SkipReason::NoRoutingView));
         }
 
@@ -1791,28 +1886,43 @@ impl PaymentVerifier {
         // routing table never holds self), so its own commitment joins the
         // sample exactly once, below.
         let now = Instant::now();
-        let mut key_counts: Vec<u32> = {
+        let (mut key_counts, filled) = {
             let guard = cache.read().await;
-            closest
+            let fresh_count = |peer_id: &PeerId| {
+                let record = guard.get(peer_id)?;
+                // Stale gossip is treated as unknown rather than as a low
+                // price, so a peer going quiet can never drag the median
+                // down, nor count toward the minimum sample.
+                if now.saturating_duration_since(record.received_at) >= GOSSIP_ANSWERABILITY_TTL {
+                    return None;
+                }
+                record
+                    .last_commitment()
+                    .map(|c| c.key_count)
+                    .filter(|count| *count <= MAX_COMMITMENT_KEY_COUNT)
+            };
+            // The key's own close group first, as the paid-quote closeness
+            // check sees it. Only when that leaves the sample short of the gate
+            // do the next nearest peers fill it, nearest first and no more than
+            // the gate needs, so a view that was already full is unchanged.
+            let mut key_counts: Vec<u32> = candidates
                 .iter()
-                .filter_map(|peer_id| {
-                    let record = guard.get(peer_id)?;
-                    // Stale gossip is treated as unknown rather than as a low
-                    // price, so a peer going quiet can never drag the median
-                    // down, nor count toward the minimum sample.
-                    if now.saturating_duration_since(record.received_at) >= GOSSIP_ANSWERABILITY_TTL
-                    {
-                        return None;
-                    }
-                    record
-                        .last_commitment()
-                        .map(|c| c.key_count)
-                        .filter(|count| *count <= MAX_COMMITMENT_KEY_COUNT)
-                })
-                .collect()
+                .take(PAID_QUOTE_ISSUER_CLOSENESS_WIDTH)
+                .filter_map(fresh_count)
+                .collect();
+            let missing = PRICE_FLOOR_MIN_NEIGHBOUR_COMMITMENTS.saturating_sub(key_counts.len());
+            let fill: Vec<u32> = candidates
+                .iter()
+                .skip(PAID_QUOTE_ISSUER_CLOSENESS_WIDTH)
+                .filter_map(fresh_count)
+                .take(missing)
+                .collect();
+            let filled = fill.len();
+            key_counts.extend(fill);
+            (key_counts, filled)
         };
 
-        let neighbours_known = key_counts.len();
+        let neighbours_sampled = key_counts.len();
         // Own count is held to the same cap as a neighbour's. Unreachable today
         // (the local builder refuses to build over-cap), but an asymmetry here
         // is the kind that quietly becomes a hole later.
@@ -1820,12 +1930,13 @@ impl PaymentVerifier {
             key_counts.push(own.key_count);
         }
         let sample = GroupSample {
-            neighbours: neighbours_known,
+            neighbours: neighbours_sampled.saturating_sub(filled),
+            filled,
             total: key_counts.len(),
             skip_reason: None,
         };
 
-        if neighbours_known < PRICE_FLOOR_MIN_NEIGHBOUR_COMMITMENTS {
+        if neighbours_sampled < PRICE_FLOOR_MIN_NEIGHBOUR_COMMITMENTS {
             return (None, sample.skipped(SkipReason::ThinSample));
         }
 
@@ -1908,7 +2019,9 @@ impl PaymentVerifier {
             .duration_since(paid_quote.timestamp)
             .map_or(0, |age| age.as_secs());
 
-        let (reference, group_sample) = self.group_reference_price(routing).await;
+        let (reference, group_sample) = self
+            .group_reference_price(routing, SampleReach::for_context(context))
+            .await;
         let contested = Self::contested(paid_price, reference, group_sample);
         let Some(reference) = reference else {
             // Not enough of the close group is known to price anything. Skip
@@ -4744,7 +4857,9 @@ mod tests {
             attach_group_commitments(&verifier, &GROUP_TEST_KEY_COUNTS, Duration::ZERO);
         verifier.set_paid_quote_k_closest_for_tests(neighbours);
 
-        let (reference, sample) = verifier.group_reference_price(&xorname).await;
+        let (reference, sample) = verifier
+            .group_reference_price(&xorname, SampleReach::CloseGroup)
+            .await;
         let reference = reference.expect("a fully populated group must produce a reference");
 
         assert_eq!(
@@ -4903,7 +5018,9 @@ mod tests {
             attach_group_commitments(&verifier, &GROUP_TEST_KEY_COUNTS, Duration::ZERO);
         verifier.set_paid_quote_k_closest_for_tests(neighbours.clone());
 
-        let (reference, _) = verifier.group_reference_price(&xorname).await;
+        let (reference, _) = verifier
+            .group_reference_price(&xorname, SampleReach::CloseGroup)
+            .await;
         let reference = reference.expect("a fully populated group must produce a reference");
         let own_price = price_at_records(own_count as usize);
         assert_eq!(reference.own, own_price);
@@ -5153,7 +5270,9 @@ mod tests {
         let neighbours =
             attach_group_commitments(&verifier, &GROUP_TEST_KEY_COUNTS, Duration::ZERO);
         verifier.set_paid_quote_k_closest_for_tests(neighbours);
-        let (reference, _) = verifier.group_reference_price(&xorname).await;
+        let (reference, _) = verifier
+            .group_reference_price(&xorname, SampleReach::CloseGroup)
+            .await;
         let reference = reference.expect("a fully populated group must produce a reference");
         assert!(
             reference.price < reference.group_median,
@@ -5349,6 +5468,427 @@ mod tests {
             .await
             .expect_err("exactly at the minimum sample the floor must evaluate and reject");
         assert!(format!("{err}").contains("below the close-group price floor"));
+    }
+
+    /// A routing view of one key for the sample-fill tests, nearest first,
+    /// with every commitment it lists attached to the gossip cache.
+    ///
+    /// The key's 20 closest are `local` (fresh commitments), then peers whose
+    /// commitment this node does not hold, up to 19 entries: the proof
+    /// builder puts the quote issuer, which has no commitment either, at
+    /// rank 20. Then come ranks 21 and on: `gap` peers with no commitment,
+    /// then `fill`, aged `fill_age`.
+    fn attach_floor_view(
+        verifier: &PaymentVerifier,
+        local: &[u32],
+        gap: usize,
+        fill: &[u32],
+        fill_age: Duration,
+    ) -> Vec<[u8; 32]> {
+        use crate::replication::commitment_state::PeerCommitmentRecord;
+
+        const KEY_LOCAL_BEFORE_ISSUER: usize = 19;
+        let id = |tag: u8, index: usize| {
+            let mut raw = [tag; 32];
+            raw[0] = u8::try_from(index).unwrap_or(u8::MAX);
+            raw
+        };
+        let record = |count: u32, age: Duration| {
+            let received_at = std::time::Instant::now()
+                .checked_sub(age)
+                .unwrap_or_else(std::time::Instant::now);
+            PeerCommitmentRecord::from_verified(
+                test_built_commitment(count).commitment().clone(),
+                received_at,
+            )
+        };
+        assert!(local.len() <= KEY_LOCAL_BEFORE_ISSUER);
+        let mut cache_map = HashMap::new();
+        let mut view = Vec::new();
+        for (index, count) in local.iter().enumerate() {
+            let peer = id(0x11, index);
+            cache_map.insert(PeerId::from_bytes(peer), record(*count, Duration::ZERO));
+            view.push(peer);
+        }
+        view.extend((local.len()..KEY_LOCAL_BEFORE_ISSUER).map(|index| id(0x22, index)));
+        view.extend((0..gap).map(|index| id(0x33, index)));
+        for (index, count) in fill.iter().enumerate() {
+            let peer = id(0x44, index);
+            cache_map.insert(PeerId::from_bytes(peer), record(*count, fill_age));
+            view.push(peer);
+        }
+        verifier.attach_commitment_cache(Arc::new(tokio::sync::RwLock::new(cache_map)));
+        view
+    }
+
+    /// A one-quote proof priced at `quote_records` and settled at `settled`,
+    /// its issuer placed at rank 20 of `view` (see [`attach_floor_view`]).
+    fn floor_view_proof(
+        verifier: &PaymentVerifier,
+        xorname: XorName,
+        quote_records: usize,
+        settled: Amount,
+        view: &[[u8; 32]],
+    ) -> Vec<u8> {
+        const ISSUER_INDEX: usize = 19;
+        let (peer_id, quote) = make_signed_quote(xorname, price_at_records(quote_records), 1);
+        let mut ranked = view.to_vec();
+        ranked.insert(ISSUER_INDEX, *peer_id.as_bytes());
+        verifier.set_paid_quote_k_closest_for_tests(ranked);
+        mark_candidate_paid(verifier, &quote, settled);
+        serialize_proof(vec![(peer_id, quote)])
+    }
+
+    /// The 14 dearest of [`GROUP_TEST_KEY_COUNTS`]: one neighbour short of the
+    /// gate in the key's 20 closest.
+    fn fourteen_dearest() -> Vec<u32> {
+        GROUP_TEST_KEY_COUNTS
+            .iter()
+            .rev()
+            .copied()
+            .take(14)
+            .collect()
+    }
+
+    /// The case the fleet run left unpriced most: a `PaidNotify` reaching a
+    /// member of the key's paid close group that knows 14 of the key's 20
+    /// closest. The 15th neighbour comes from rank 21, and the floor refuses a
+    /// baseline payment on that sample where it used to skip.
+    #[tokio::test]
+    async fn a_thin_paid_list_view_is_filled_from_the_next_nearest_peer_and_refuses() {
+        let verifier = floor_test_verifier();
+        let xorname = [0xE1u8; 32];
+        let view = attach_floor_view(&verifier, &fourteen_dearest(), 0, &[3_000], Duration::ZERO);
+        let proof_bytes = floor_view_proof(
+            &verifier,
+            xorname,
+            0,
+            three_times(price_at_records(0)),
+            &view,
+        );
+
+        let (reference, sample) = verifier
+            .group_reference_price(&xorname, SampleReach::Filled)
+            .await;
+        assert_eq!(
+            sample.neighbours, 14,
+            "neighbours still counts the key's 20 closest"
+        );
+        assert_eq!(
+            sample.total, 16,
+            "14 key-local, 1 from rank 21, and this node's own"
+        );
+        assert_eq!(
+            reference.expect("a filled view is priced").group_median,
+            price_at_records(4_400),
+            "the lower median of 3,000, 3,200..5,800 and this node's own"
+        );
+        let err = verifier
+            .verify_payment(
+                &xorname,
+                Some(&proof_bytes),
+                VerificationContext::PaidListAdmission,
+            )
+            .await
+            .expect_err("a filled view refuses a payment below its floor");
+        assert!(format!("{err}").contains("below the close-group price floor"));
+    }
+
+    /// A store admission is never filled: a peer that refuses a fresh offer or
+    /// a client PUT can be judged by a peer that stored the write (its
+    /// possession check, its audits), so refusing one on a view the contest
+    /// margin was never measured on would turn a refusal into a penalty. The
+    /// same 14-neighbour view skips there, as before, and the fan-out decision
+    /// never fills either.
+    #[tokio::test]
+    async fn a_thin_store_admission_view_is_not_filled() {
+        for context in [
+            VerificationContext::ClientPut,
+            VerificationContext::FreshReplication,
+        ] {
+            let verifier = floor_test_verifier();
+            let xorname = [0xE8u8; 32];
+            let view =
+                attach_floor_view(&verifier, &fourteen_dearest(), 0, &[3_000], Duration::ZERO);
+            let proof_bytes = floor_view_proof(
+                &verifier,
+                xorname,
+                0,
+                three_times(price_at_records(0)),
+                &view,
+            );
+
+            let status = verifier
+                .verify_payment(&xorname, Some(&proof_bytes), context)
+                .await
+                .expect("a thin store admission skips the floor");
+            assert_eq!(status, PaymentStatus::PaymentVerified, "{context:?}");
+            assert!(verifier.verified_payment_contested(&xorname), "{context:?}");
+            assert!(verifier.price_contested(&xorname, &proof_bytes).await);
+        }
+
+        let verifier = floor_test_verifier();
+        let xorname = [0xE9u8; 32];
+        let view = attach_floor_view(&verifier, &fourteen_dearest(), 0, &[3_000], Duration::ZERO);
+        floor_view_proof(
+            &verifier,
+            xorname,
+            0,
+            three_times(price_at_records(0)),
+            &view,
+        );
+        let (reference, sample) = verifier
+            .group_reference_price(&xorname, SampleReach::CloseGroup)
+            .await;
+        assert!(reference.is_none());
+        assert_eq!(
+            (sample.neighbours, sample.total, sample.skip_reason),
+            (14, 15, Some(SkipReason::ThinSample))
+        );
+    }
+
+    /// The reach each context samples with, written out so a change to any
+    /// of them is a decision and not a side effect.
+    #[test]
+    fn only_paid_list_admission_fills_the_floor_sample() {
+        assert_eq!(
+            SampleReach::for_context(VerificationContext::ClientPut),
+            SampleReach::CloseGroup
+        );
+        assert_eq!(
+            SampleReach::for_context(VerificationContext::FreshReplication),
+            SampleReach::CloseGroup
+        );
+        assert_eq!(
+            SampleReach::for_context(VerificationContext::PaidListAdmission),
+            SampleReach::Filled
+        );
+    }
+
+    /// A filled view prices refusals only: it reaches past the key's close
+    /// group, where the 2x contest margin was never measured, so even a
+    /// payment at its median stays contested and judges no peer.
+    #[tokio::test]
+    async fn a_filled_view_contests_even_a_payment_at_its_median() {
+        let verifier = floor_test_verifier();
+        let xorname = [0xE2u8; 32];
+        let view = attach_floor_view(&verifier, &fourteen_dearest(), 0, &[3_000], Duration::ZERO);
+        let proof_bytes = floor_view_proof(
+            &verifier,
+            xorname,
+            4_400,
+            three_times(price_at_records(4_400)),
+            &view,
+        );
+
+        let status = verifier
+            .verify_payment(
+                &xorname,
+                Some(&proof_bytes),
+                VerificationContext::PaidListAdmission,
+            )
+            .await
+            .expect("a payment at the median clears the floor");
+        assert_eq!(status, PaymentStatus::PaymentVerified);
+        assert!(verifier.price_contested(&xorname, &proof_bytes).await);
+        assert!(verifier.verified_payment_contested(&xorname));
+    }
+
+    /// A key-local view that already holds 15 neighbours is priced exactly as
+    /// before: peers from rank 21 on never enter it, however cheap.
+    #[tokio::test]
+    async fn a_full_key_view_takes_nothing_from_rank_21_on() {
+        let verifier = floor_test_verifier();
+        let xorname = [0xE3u8; 32];
+        let view = attach_floor_view(
+            &verifier,
+            &GROUP_TEST_KEY_COUNTS,
+            0,
+            &[1, 1, 1, 1, 1],
+            Duration::ZERO,
+        );
+        floor_view_proof(
+            &verifier,
+            xorname,
+            0,
+            three_times(price_at_records(0)),
+            &view,
+        );
+
+        let (reference, sample) = verifier
+            .group_reference_price(&xorname, SampleReach::Filled)
+            .await;
+        assert_eq!((sample.neighbours, sample.total), (15, 16));
+        assert_eq!(
+            reference.expect("a full view is priced").group_median,
+            price_at_records(GROUP_TEST_MEDIAN_KEY_COUNT as usize)
+        );
+    }
+
+    /// The fill takes the nearest commitments first, and only as many as the
+    /// gate needs: with 13 known, ranks 21 and 22 (1,000 keys each) fill it,
+    /// and the dearer peers behind them stay out. Either other choice moves
+    /// the lower median from 4,400 to 4,800.
+    #[tokio::test]
+    async fn a_thin_view_fills_with_the_nearest_peers_and_no_more() {
+        let verifier = floor_test_verifier();
+        let xorname = [0xE4u8; 32];
+        let thirteen: Vec<u32> = GROUP_TEST_KEY_COUNTS
+            .iter()
+            .rev()
+            .copied()
+            .take(13)
+            .collect();
+        let view = attach_floor_view(
+            &verifier,
+            &thirteen,
+            0,
+            &[1_000, 1_000, 9_000, 9_000, 9_000],
+            Duration::ZERO,
+        );
+        floor_view_proof(
+            &verifier,
+            xorname,
+            0,
+            three_times(price_at_records(0)),
+            &view,
+        );
+
+        let (reference, sample) = verifier
+            .group_reference_price(&xorname, SampleReach::Filled)
+            .await;
+        assert_eq!((sample.neighbours, sample.total), (13, 16));
+        assert_eq!(
+            reference.expect("a filled view is priced").group_median,
+            price_at_records(4_400)
+        );
+    }
+
+    /// The fill reaches rank 60 of the key and no further: a fresh commitment
+    /// at rank 60 completes the sample, one at rank 61 does not.
+    #[tokio::test]
+    async fn the_fill_reaches_rank_60_and_no_further() {
+        for (gap, priced) in [(39, true), (40, false)] {
+            let verifier = floor_test_verifier();
+            let xorname = [0xE5u8; 32];
+            let view = attach_floor_view(
+                &verifier,
+                &fourteen_dearest(),
+                gap,
+                &[3_000],
+                Duration::ZERO,
+            );
+            let proof_bytes = floor_view_proof(
+                &verifier,
+                xorname,
+                0,
+                three_times(price_at_records(0)),
+                &view,
+            );
+            let rank = 20 + gap + 1;
+
+            let (reference, sample) = verifier
+                .group_reference_price(&xorname, SampleReach::Filled)
+                .await;
+            assert_eq!(reference.is_some(), priced, "fill at rank {rank}");
+            let result = verifier
+                .verify_payment(
+                    &xorname,
+                    Some(&proof_bytes),
+                    VerificationContext::PaidListAdmission,
+                )
+                .await;
+            assert_eq!(result.is_err(), priced, "fill at rank {rank}: {result:?}");
+            if !priced {
+                assert_eq!(sample.skip_reason, Some(SkipReason::ThinSample));
+                assert!(verifier.verified_payment_contested(&xorname));
+            }
+        }
+    }
+
+    /// Only a fresh commitment within the count cap fills a thin view, as in
+    /// the key-local sample: a stale one or an over-cap one leaves it thin.
+    #[tokio::test]
+    async fn a_stale_or_over_cap_commitment_does_not_fill() {
+        let stale = GOSSIP_ANSWERABILITY_TTL + Duration::from_secs(1);
+        let verifier = floor_test_verifier();
+        let xorname = [0xE6u8; 32];
+        let view = attach_floor_view(&verifier, &fourteen_dearest(), 0, &[3_000], stale);
+        floor_view_proof(
+            &verifier,
+            xorname,
+            0,
+            three_times(price_at_records(0)),
+            &view,
+        );
+        let (reference, sample) = verifier
+            .group_reference_price(&xorname, SampleReach::Filled)
+            .await;
+        assert!(reference.is_none(), "a stale commitment does not fill");
+        assert_eq!(sample.skip_reason, Some(SkipReason::ThinSample));
+
+        let verifier = floor_test_verifier();
+        let view = attach_floor_view(&verifier, &fourteen_dearest(), 0, &[3_000], Duration::ZERO);
+        let fill_peer = view
+            .get(19)
+            .copied()
+            .expect("rank 21 before the issuer goes in");
+        forge_key_counts(
+            &verifier,
+            Some(&[fill_peer]),
+            MAX_COMMITMENT_KEY_COUNT.saturating_add(1),
+        )
+        .await;
+        floor_view_proof(
+            &verifier,
+            xorname,
+            0,
+            three_times(price_at_records(0)),
+            &view,
+        );
+        let (reference, sample) = verifier
+            .group_reference_price(&xorname, SampleReach::Filled)
+            .await;
+        assert!(reference.is_none(), "an over-cap commitment does not fill");
+        assert_eq!(sample.skip_reason, Some(SkipReason::ThinSample));
+    }
+
+    /// A filled view keeps the own-price cap: neighbours that overstate their
+    /// counts, at rank 21 and inside the key's 20 closest alike, cannot make
+    /// this node refuse a payment that clears its own price.
+    #[tokio::test]
+    async fn a_filled_view_keeps_the_own_price_cap() {
+        let verifier = floor_test_verifier_with_own_count(2_000);
+        let xorname = [0xE7u8; 32];
+        let view = attach_floor_view(&verifier, &fourteen_dearest(), 0, &[3_000], Duration::ZERO);
+        let known: Vec<[u8; 32]> = view.iter().take(14).chain(view.get(19)).copied().collect();
+        forge_key_counts(&verifier, Some(&known), MAX_COMMITMENT_KEY_COUNT).await;
+        let proof_bytes = floor_view_proof(
+            &verifier,
+            xorname,
+            0,
+            three_times(price_at_records(0)),
+            &view,
+        );
+
+        let (reference, _) = verifier
+            .group_reference_price(&xorname, SampleReach::Filled)
+            .await;
+        let reference = reference.expect("a filled view is priced");
+        assert_eq!(
+            reference.price,
+            price_at_records(2_000),
+            "capped at its own price"
+        );
+        let status = verifier
+            .verify_payment(
+                &xorname,
+                Some(&proof_bytes),
+                VerificationContext::PaidListAdmission,
+            )
+            .await
+            .expect("a payment that clears 30% of its own price is admitted");
+        assert_eq!(status, PaymentStatus::PaymentVerified);
     }
 
     /// A receiver with no live commitment of its own must skip, and leave its
@@ -5548,7 +6088,9 @@ mod tests {
         forge_key_counts(&verifier, Some(&neighbours), MAX_COMMITMENT_KEY_COUNT).await;
 
         verifier.set_paid_quote_k_closest_for_tests(neighbours.clone());
-        let (reference, _) = verifier.group_reference_price(&xorname).await;
+        let (reference, _) = verifier
+            .group_reference_price(&xorname, SampleReach::CloseGroup)
+            .await;
         let reference = reference.expect("a fully populated group must produce a reference");
         assert_eq!(
             reference.group_median,
@@ -5744,7 +6286,9 @@ mod tests {
         }
         verifier.set_paid_quote_k_closest_for_tests(all);
 
-        let (reference, sample) = verifier.group_reference_price(&xorname).await;
+        let (reference, sample) = verifier
+            .group_reference_price(&xorname, SampleReach::CloseGroup)
+            .await;
 
         assert_eq!(
             sample.neighbours,
