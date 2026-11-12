@@ -2188,10 +2188,13 @@ impl PaymentVerifier {
         xorname: &XorName,
         issuer_peer_id: &PeerId,
     ) -> Result<()> {
+        // The override is read as a ranked view, like the floor's, so only its
+        // first K count: an issuer a test ranks past them is not K-close.
         #[cfg(any(test, feature = "test-utils"))]
         if let Some(k_closest_peer_ids) = self.test_paid_quote_k_closest_override.read().as_ref() {
             if k_closest_peer_ids
                 .iter()
+                .take(PAID_QUOTE_ISSUER_CLOSENESS_WIDTH)
                 .any(|peer_id| peer_id == issuer_peer_id.as_bytes())
             {
                 return Ok(());
@@ -5592,6 +5595,36 @@ mod tests {
         verifier.set_paid_quote_k_closest_for_tests(ranked);
         mark_candidate_paid(verifier, &quote, settled);
         serialize_proof(vec![(peer_id, quote)])
+    }
+
+    /// The fill widens the floor's sample, never the paid quote's issuer
+    /// check: an issuer ranked 21st is refused as not K-close, in the very
+    /// view whose rank-21 commitment would fill the sample.
+    #[tokio::test]
+    async fn a_paid_quote_issuer_ranked_21st_is_refused_where_a_commitment_would_fill() {
+        const RANK_21_INDEX: usize = 20;
+        let verifier = floor_test_verifier();
+        let xorname = [0xEAu8; 32];
+        let view = attach_floor_view(&verifier, &fourteen_dearest(), 0, &[3_000], Duration::ZERO);
+        let (peer_id, quote) = make_signed_quote(xorname, price_at_records(4_400), 1);
+        let mut ranked = view;
+        ranked.insert(RANK_21_INDEX, *peer_id.as_bytes());
+        verifier.set_paid_quote_k_closest_for_tests(ranked);
+        mark_candidate_paid(&verifier, &quote, three_times(price_at_records(4_400)));
+        let proof_bytes = serialize_proof(vec![(peer_id, quote)]);
+
+        let err = verifier
+            .verify_payment(
+                &xorname,
+                Some(&proof_bytes),
+                VerificationContext::PaidListAdmission,
+            )
+            .await
+            .expect_err("an issuer past the key's 20 closest is not K-close");
+        assert!(
+            format!("{err}").contains("is not among this node's local K=20 closest"),
+            "{err}"
+        );
     }
 
     /// The 14 dearest of [`GROUP_TEST_KEY_COUNTS`]: one neighbour short of the
