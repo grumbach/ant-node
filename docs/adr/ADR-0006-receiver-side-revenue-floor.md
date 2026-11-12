@@ -369,10 +369,22 @@ replication), arriving in 48 upload bursts. Of those, 1,801 admissions over
    - its paid price is below 60% of the **uncapped** group median, twice the
      30% floor.
 
-   A payment the floor refuses for a chunk is remembered as contested too,
-   in the same memory, so a node judges no peer on a write it refused on
-   price however it records the key later, and a key that repair
-   verification authorises is recorded with that remembered decision.
+   A payment the floor refuses for a chunk is kept, so a node judges no peer
+   on a write it refused on price however it records the key later: the
+   first paid-list record of that key, whether a later payment or repair
+   verification writes it, is marked. Refusals are kept in an LMDB store of
+   their own beside the paid list, never as paid entries, so a refusal is
+   no paid-list vote. Each is committed before the refusal is reported,
+   under the same write order as every paid-list write, so a first record
+   either reads it or was written before it. Refusals are never pruned:
+   they survive restarts and the removal or eviction of the key's paid
+   entry, so the key comes back marked. The store keeps up to 1,000,000
+   addresses (128 MiB). A refusal of a new address past that saturates it
+   instead, and from then on, across restarts, the node marks every key it
+   records. If a refusal cannot be committed, the node reports a storage
+   error instead of the refusal, and if the store cannot be written or
+   read, the node marks every key it records until it restarts. An
+   existing paid entry keeps its mark either way.
 
    An admitted contested write, one the node cannot price or one paid between
    the floor and that threshold, is still stored and its offers still sent,
@@ -421,10 +433,10 @@ replication), arriving in 48 upload bursts. Of those, 1,801 admissions over
      logs how many failed.
 
    The mark follows the decision the node took when it verified the payment:
-   the verifier remembers which chunk payments the floor contested, and
-   since the paid-list sample fill which it refused, in a memory of its own
-   sized for 100,000 of them, so a small payment cache
-   cannot make it forget one before the key is recorded. A write admitted
+   the verifier remembers which chunk payments the floor contested, in a
+   memory of its own sized for 100,000 of them, so a small payment cache
+   cannot make it forget one before the key is recorded, and the ones it
+   refused are kept as above. A write admitted
    later from the payment cache is recorded by that decision. The proof
    attached to it was never checked, and anyone can attach one to a
    `PaidNotify` or a fresh offer, so it can neither set the mark nor veto it.
@@ -596,12 +608,11 @@ out of 1,801:
   contested and marks it (item 4), so it judges none of the peers that
   refused it while it holds the key. When the accepting nodes are a majority
   of the paid group, the refusers repair the key from those votes like any
-  other. Repair carries no proof to price, so a refuser records it by the
-  decision it remembers: marked while it still remembers refusing the
-  payment, unmarked once it has restarted or forgotten the refusal under
-  100,000 newer refused or contested payments, or when it already held an
-  unmarked entry for the key. A refuser whose own quorum check fails while
-  its neighbours' passes can then be judged on it.
+  other. Repair carries no proof to price, so each node records the key by
+  its own decision: a refuser marked, from the refusal it kept, unless it
+  already held an unmarked entry for the key; a node that never verified a
+  payment for it, plainly. Such a node can judge a refuser whose own quorum
+  check fails while its own passes.
 - **A marked copy outside a key's queried groups is not a repair source.**
   A paid hint makes no possession claim, so no node is asked for a key's
   bytes because it paid-hinted the key. A node repairing a key fetches from
@@ -624,10 +635,12 @@ out of 1,801:
   - A PUT served from the payment cache with no proof attached stores the
     record without writing a paid-list entry at all, as before this change,
     so it is not marked either.
-  - The verifier's memory of contested and refused payments is bounded: a
-    decision is lost before its key is recorded only if 100,000 newer such
-    payments reach the node in the moments between its verification and
-    its record.
+  - The verifier's memory of contested admissions is bounded and in memory
+    only: a decision is lost before its key is recorded if the node
+    restarts, or 100,000 newer contested or refused payments reach it, in
+    the moments between its verification and its record, and a later
+    repair of the key records it plainly. Refusals are kept apart (item 4),
+    so they are not lost this way.
   - A paid-list insert that fails before its commit leaves the key out of
     the paid list, so unmarked. When a marked insert's commit is what
     failed, the in-memory copy keeps the mark, since the commit may still
@@ -641,13 +654,25 @@ out of 1,801:
   lands. At a price between the floor and the contest threshold, or at any
   price on nodes that cannot price, the nodes it reaches first mark the key
   and leave it unchecked, though they still store and repair it. Below the
-  floor, the nodes that refuse it remember the key as contested, so they mark
-  the client's write when it comes, while they remember it. Those among
+  floor, the nodes that refuse it keep the refusal, so they mark the
+  client's write when it comes. That reaches the same nodes and keys as the
+  front-run between floor and threshold, since a self-paying quoter can
+  overpay its own cheap quote to clear their floors, but lasts longer: a
+  kept refusal also marks the key's next record after its paid entry is
+  evicted. Those among
   the client's storers skip their possession check too, while storers it did
   not reach first still run theirs. Paying above the
   threshold first does the opposite: those nodes record the key unmarked and
   can judge peers that later refuse the client's cheaper write, until those
   peers repair it from the votes the front-run created.
+- **A node's refusal store can be filled on purpose.** Below-floor payments
+  for 1,000,001 distinct chunks that one node verifies, each settled on
+  chain, saturate its refusal store. Batched payments to the attacker's own
+  near-empty quoter leave gas as the main cost. The node then marks every
+  key it records from then on, so it stops hinting new keys as replicas and
+  auditing its peers on them. Its existing entries, and the other holders'
+  checks, are unchanged. A refusal store that cannot be written or read
+  does the same until the node restarts.
 - **Rollout skew is the main rollout risk.** Until the fleet upgrades, a node
   on an older release admits every payment and still probes every
   fresh-offer target 5 to 15 minutes later. Each upgraded peer that refused a
@@ -715,6 +740,17 @@ out of 1,801:
     when that memory holds a decision for it, and an existing record is left
     as it is; the paid-list mark is written only with a new entry, survives a
     restart and a later plain insert, and goes with the entry;
+  - a chunk payment refused on price, in every context, is kept as no paid
+    entry, across a restart and past 100,000 newer contested payments, and
+    marks the first record of its key by either insert, repair included,
+    after a restart and after the key's entry is removed; an existing entry
+    keeps its mark; a pointer refused on price, or a proof that fails before
+    the floor, keeps nothing; the store saturates past its cap and stays
+    saturated after a restart; a refusal that cannot be committed, or one
+    made after the paid list has closed, is a storage error; a failed write
+    or read marks every new record until restart; a refusal and a first
+    record of its key never interleave, and the refusal of a dropped caller
+    still commits before `wait_idle` returns;
   - only a paid-list admission fills a thin sample, within rank 60 and only
     to the gate, and a write a filled view admits is contested;
   - a marked key is left out of replica hints, from the in-memory marks
@@ -826,13 +862,10 @@ view that already held 15 is unchanged. The filled reference refuses below
 the floor like any other, with the same lower median, own-price cap and
 tolerance, and a write it admits is contested, so it judges no peer. Client
 PUTs, fresh offers and the fan-out decision are not filled. A chunk payment
-the floor refuses is remembered as contested, and a key that repair
-verification authorises (a presence quorum or a paid-list majority) and that
-this node has no entry for yet is recorded with the remembered decision, so a
-node judges no peer on a write it refused on price; an existing entry keeps
-its mark either way. The memory is bounded at 100,000 payments and not
-persisted: a key first recorded through repair after a restart is recorded
-plainly, as every repaired key was before. The telemetry line keeps its key set: `neighbours`
+the floor refuses is kept (item 4), so a key that repair verification
+authorises (a presence quorum or a paid-list majority) and that this node
+has no entry for yet is recorded marked: a node judges no peer on a write it
+refused on price; an existing entry keeps its mark either way. The telemetry line keeps its key set: `neighbours`
 still counts the key's 20 closest and `group_sample` is the sample the median
 used, so a filled view logs `group_sample` above `neighbours + 1`.
 
