@@ -2,7 +2,8 @@
 
 - **Status:** Proposed
 - **Date:** 2026-07-14 (amended 2026-08-05 after canary measurement; Amendment 2
-  2026-10-20: enforced on every node)
+  2026-10-20: enforced on every node; 2026-11-12: paid-list admission fills a
+  thin sample)
 - **Decision owners:** Anselme (@grumbach)
 - **Reviewers:** <pending>
 - **Supersedes:** none (amends the economic scope of ADR-0004; see Decision)
@@ -284,8 +285,8 @@ is accepted as a residual that could not be measured.
 
 Shadow telemetry from ant-prod-01, 2026-10-14T00:33Z to 2026-10-20T00:07Z, on
 node 0.22.0 and 0.23.0: 2,117 floor lines from 699 node instances on 72 hosts.
-54 of them (2.6%) skipped, all `thin_sample` with 14 known neighbours; across
-all lines the median receiver knew 18. Replaying the logged formula
+54 of them (2.6%) skipped, all `thin_sample`, 52 with 12 to 14 known
+neighbours (28 at 14); across all lines the median receiver knew 18. Replaying the logged formula
 reproduced all 53 of the nodes' own `below_floor=true` lines (47 distinct
 admissions) exactly. Taking each chunk and receiver once leaves 1,898
 admissions over 536 chunks (944 first seen as a client PUT, 954 as fresh
@@ -361,10 +362,17 @@ replication), arriving in 48 upload bursts. Of those, 1,801 admissions over
    admits the payment for a write (as the node a client PUT it to, on a fresh
    offer, or on a `PaidNotify`), it prices the proof against its current
    view; a later admission of the same write from the payment cache reuses
-   that decision. The write is *contested* in two cases:
+   that decision. The write is *contested* in three cases:
    - the node cannot price it (no own commitment, or too thin a view);
+   - it priced a `PaidNotify` only on a view filled past the key's 20
+     closest (see "Paid-list admission fills a thin sample" below);
    - its paid price is below 60% of the **uncapped** group median, twice the
      30% floor.
+
+   A payment the floor refuses for a chunk is remembered as contested too,
+   in the same memory, so a node judges no peer on a write it refused on
+   price however it records the key later, and a key that repair
+   verification authorises is recorded with that remembered decision.
 
    An admitted contested write, one the node cannot price or one paid between
    the floor and that threshold, is still stored and its offers still sent,
@@ -379,23 +387,19 @@ replication), arriving in 48 upload bursts. Of those, 1,801 admissions over
      repair proof is recorded for it, so no responsible audit challenges a
      peer on it, and no peer can penalise this node as its sole hinter. A
      paid hint is never punished, and repair still works wherever the group
-     accepted the key. Above 100,000 entries a node builds paid hints only
-     from keys near itself (ADR-0028), while replica hints have no such
-     limit, so a marked key it stores is a paid-hint candidate at any
-     distance. It goes to the members of the key's close group the node
-     knows, the peers a replica hint would have reached, so a record it
-     retains far from itself still reaches them, and a sync message carries
-     no more such keys than replica hints would have. The node also keeps its
-     marked keys in memory, so leaving them out of the hints it builds for a
-     peer, or adding them, reads nothing on disk but each far stored marked
-     key's paid entry. Each paid-list write updates that copy in commit order, a new
-     mark just before its commit, so the copy never lacks a committed mark,
+     accepted the key. Paid hints, like replica hints, are built from every
+     key range in which the peer can be in a key's group, however far the
+     key lies from this node, so a marked record this node keeps far from
+     itself still reaches its group, as a paid hint. The node also keeps its
+     marked keys in memory, so leaving them out of the replica hints it
+     builds reads nothing more on disk. Each paid-list write updates that
+     copy in commit order, a new mark just before its commit, so the copy never lacks a committed mark,
      and a write that commits the key unmarked, a plain insert that adds it
      or a removal, drops any mark the copy holds for it. If the marks cannot
      be read when the node starts, it still starts, as before, and hints no
-     key as a replica until a restart can read them; since any key it stores
-     may then be marked, each one with a paid entry is a paid-hint candidate
-     at any distance instead;
+     key as a replica until a restart can read them; its paid hints are
+     built as before, so each stored key with a paid entry still reaches its
+     group as one;
    - the responsible audit never samples a marked key, which also covers one
      hinted in the moment before its mark was written;
    - a prune audit, which is sent only under disk pressure (ADR-0028), still
@@ -417,8 +421,9 @@ replication), arriving in 48 upload bursts. Of those, 1,801 admissions over
      logs how many failed.
 
    The mark follows the decision the node took when it verified the payment:
-   the verifier remembers which admitted chunk payments the floor contested,
-   in a memory of its own sized for 100,000 of them, so a small payment cache
+   the verifier remembers which chunk payments the floor contested, and
+   since the paid-list sample fill which it refused, in a memory of its own
+   sized for 100,000 of them, so a small payment cache
    cannot make it forget one before the key is recorded. A write admitted
    later from the payment cache is recorded by that decision. The proof
    attached to it was never checked, and anyone can attach one to a
@@ -591,8 +596,12 @@ out of 1,801:
   contested and marks it (item 4), so it judges none of the peers that
   refused it while it holds the key. When the accepting nodes are a majority
   of the paid group, the refusers repair the key from those votes like any
-  other, unmarked, since repair carries no proof to price; a refuser whose own
-  quorum check fails while its neighbours' passes can then be judged on it.
+  other. Repair carries no proof to price, so a refuser records it by the
+  decision it remembers: marked while it still remembers refusing the
+  payment, unmarked once it has restarted or forgotten the refusal under
+  100,000 newer refused or contested payments, or when it already held an
+  unmarked entry for the key. A refuser whose own quorum check fails while
+  its neighbours' passes can then be judged on it.
 - **A marked copy outside a key's queried groups is not a repair source.**
   A paid hint makes no possession claim, so no node is asked for a key's
   bytes because it paid-hinted the key. A node repairing a key fetches from
@@ -615,9 +624,9 @@ out of 1,801:
   - A PUT served from the payment cache with no proof attached stores the
     record without writing a paid-list entry at all, as before this change,
     so it is not marked either.
-  - The verifier's memory of contested admissions is bounded: a decision is
-    lost before its key is recorded only if 100,000 newer contested
-    admissions reach the node in the moments between its verification and
+  - The verifier's memory of contested and refused payments is bounded: a
+    decision is lost before its key is recorded only if 100,000 newer such
+    payments reach the node in the moments between its verification and
     its record.
   - A paid-list insert that fails before its commit leaves the key out of
     the paid list, so unmarked. When a marked insert's commit is what
@@ -631,7 +640,9 @@ out of 1,801:
   for the key, for gas only, and announce it before the client's write
   lands. At a price between the floor and the contest threshold, or at any
   price on nodes that cannot price, the nodes it reaches first mark the key
-  and leave it unchecked, though they still store and repair it; those among
+  and leave it unchecked, though they still store and repair it. Below the
+  floor, the nodes that refuse it remember the key as contested, so they mark
+  the client's write when it comes, while they remember it. Those among
   the client's storers skip their possession check too, while storers it did
   not reach first still run theirs. Paying above the
   threshold first does the opposite: those nodes record the key unmarked and
@@ -699,13 +710,17 @@ out of 1,801:
   - a node with no floor wired contests nothing;
   - the verifier remembers a contested payment it admitted, in a memory a
     small payment cache cannot shrink, a later cache-hit admission reads that
-    decision, and a refused payment is never remembered; the paid-list mark
-    is written only with a new entry, survives a restart and a later plain
-    insert, and goes with the entry;
-  - a marked key is left out of replica hints and of responsible-audit
-    sampling, a marked key this node stores is a paid-hint candidate
-    however far it is, while one it does not store, an unmarked one or a
-    near one is left to the near-key read, paid-list eviction drops the
+    decision, and a chunk payment refused on price is remembered as
+    contested too; a key repair verification authorises is recorded marked
+    when that memory holds a decision for it, and an existing record is left
+    as it is; the paid-list mark is written only with a new entry, survives a
+    restart and a later plain insert, and goes with the entry;
+  - only a paid-list admission fills a thin sample, within rank 60 and only
+    to the gate, and a write a filled view admits is contested;
+  - a marked key is left out of replica hints, from the in-memory marks
+    alone, and still goes out as a paid hint to the same peer, no key is
+    hinted as a replica while the marks are unknown, a marked key is left
+    out of responsible-audit sampling, paid-list eviction drops the
     mark of an entry it evicts and leaves a kept entry marked, and it keeps
     the entry of a record that cannot be read for the moment;
   - paid-list eviction keeps the entry and the mark of a record stored
@@ -750,28 +765,6 @@ out of 1,801:
     cache with a forged proof the floor would contest, mark the key exactly
     when the recording node's own verified decision was contested, and never
     from that proof.
-- 54 mutations of the floor, the contest decision, the verifier's memory,
-  the mark, its in-memory copy and every check that reads the mark were run
-  against these unit and e2e tests on this amendment's code before ADR-0028
-  merged, and 53 failed at least one of them. Two of the 54 targeted the
-  paid-pruning rule ADR-0028 made unnecessary, which is gone. The one that
-  survived makes prune-audit scoring count a mark that cannot be read as
-  unset. Only the e2e prune test reaches that check, and it cannot make a
-  node's paid-list read fail; the same read counts as set, under test, in
-  the audit and the fan-out. Five more were run on the code merged with
-  ADR-0028, and each fails: an eviction that leaves an evicted entry's mark
-  in memory fails four unit tests; leaving far stored marked keys out of
-  paid hints, treating unknown marks as no marks, and keeping only readable
-  records' entries through eviction each fail their unit test; and
-  prune-audit scoring that ignores the mark fails the e2e prune test, which
-  runs under disk pressure. Ten more were run on the coordination of
-  eviction with record admission, and each fails at least one of its seven
-  interleaving tests: a removal that does not ask again; a `put_after`, a
-  `put`, a `holds_verified` or the client PUT handler that registers no
-  admission; an admission check that ignores writes in flight; an
-  admission that does not wait for a held eviction; a guard dropped before
-  the removal; the keep rule back to the index alone; and all of the
-  coordination removed at once, which fails all seven.
 - `tests/e2e/price_floor_ab.rs` drives the same honest and near-empty-quoter
   uploads through a production-wired local testnet. Nodes are seeded to
   production-sized commitments, payments are real (on Anvil), and possession
@@ -813,6 +806,85 @@ out of 1,801:
   aged proofs (`paid_quote_age_secs`) and
   payments to near-empty quoters are read the same way. The raise then
   follows the two steps in item 4.
+
+### Paid-list admission fills a thin sample (2026-11-12)
+
+**The gap.** A node learns commitments only through neighbour sync: from the
+20 peers closest to itself and from the peers that count it among theirs. The
+floor asks for the key's 20 closest. A member of a key's paid close group that
+sits at its edge knows its own side of the key's neighbourhood, not the far
+side, so it often holds only 12 to 14 of them and skipped the floor. A skipped
+`PaidNotify` is admitted, so the write gets that node's paid-list vote, which
+is what repair needs, however little it paid. A `PaidNotify` reaches the whole
+paid close group, so this is where views are thinnest: on a 990-node network,
+22.4% of paid-list admissions skipped, against 3.9% of store admissions.
+
+**The rule.** A paid-list admission whose view holds fewer than 15 of the
+key's 20 closest fills it from the key's next nearest peers, nearest first,
+up to rank 60 and only to 15 (`PRICE_FLOOR_SAMPLE_WIDTH`, `SampleReach`). A
+view that already held 15 is unchanged. The filled reference refuses below
+the floor like any other, with the same lower median, own-price cap and
+tolerance, and a write it admits is contested, so it judges no peer. Client
+PUTs, fresh offers and the fan-out decision are not filled. A chunk payment
+the floor refuses is remembered as contested, and a key that repair
+verification authorises (a presence quorum or a paid-list majority) and that
+this node has no entry for yet is recorded with the remembered decision, so a
+node judges no peer on a write it refused on price; an existing entry keeps
+its mark either way. The memory is bounded at 100,000 payments and not
+persisted: a key first recorded through repair after a restart is recorded
+plainly, as every repaired key was before. The telemetry line keeps its key set: `neighbours`
+still counts the key's 20 closest and `group_sample` is the sample the median
+used, so a filled view logs `group_sample` above `neighbours + 1`.
+
+**Why paid-list admission only.** The own-price cap keeps a refusal safe on
+any sample. Judging is different. A peer that refuses a fresh offer or a
+client PUT can be judged by a peer that stored the write: its possession
+check after a fan-out, and later its audits. The twofold contest margin that
+keeps that from happening was only measured between views of the key's close
+group. A refused `PaidNotify` is dropped and judged by nobody, and refusing it
+is what keeps a below-floor write from the paid-list votes that repair needs.
+
+**Measured in a model.** A geometric model (uniform ids, key counts from
+the keys each node's position makes it hold, each node knowing exactly the
+commitments neighbour sync gives it) shows the same pattern as the network
+above: 24.0% of paid-list and 6.8% of store admissions unpriced under the old
+rule. Its figures are model estimates, not measurements. In it the fill
+leaves no paid-list admission unpriced, refuses no honest payment, and cuts
+the share of keys on which a write paying 3x a baseline quote still gets
+repair authority from 51.6% to 29.9%. The alternatives fared worse:
+
+- filling every context: keys where a refusing and a judging receiver
+  coexist rose from 0.33% to 1.93% (5,000 nodes), because the new store
+  refusers can be judged by full-view storers;
+- a gate of 10 for refusal and contest alike: 4.4% of paid-list admissions
+  still unpriced, and that conflict on 6.7% of keys;
+- the receiver's own 20 closest instead of the key's: two receivers of a key
+  price different neighbourhoods, and every view changes;
+- fetching missing commitments, or widening neighbour sync: new machinery,
+  or several times the sync work, for what the fill gets from state the node
+  already holds;
+- also contesting a write paid below 30% of the dearest commitment a node
+  knows: one node that overstates its own count would make every nearby write
+  contested on its neighbours, and so exempt itself from their audits.
+
+**Residuals.**
+
+- Refusing more `PaidNotify`s means fewer paid-list votes for below-floor
+  writes, so their repair verification fails more often, and a node that
+  hints such a key as its sole replica source is penalised (weight 1) by the
+  peers whose check fails, as it already is for any key a quorum rejects. A
+  holder whose own view judged the write uncontested can be that node: the
+  contest margin's existing residual, now reached through votes.
+- Overstating commitments at ranks 21 to 60 can now sway a filled view. The
+  cap bounds what they can make it refuse, and a refused `PaidNotify` costs a
+  vote, not a penalty.
+- An honest client whose only reachable quoter is fresh loses the paid-list
+  votes of edge members too (49.3% to 28.3% of the paid group admitting it in
+  the model); its store acceptance is unchanged. It cannot be told apart from
+  a baseline underpayment.
+- Releases before this one keep voting for every write until the fleet
+  upgrades. Store admissions are unchanged, so rollout skew is as described
+  above.
 
 ## Notes for AI-assisted work
 
